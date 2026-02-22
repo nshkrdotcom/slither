@@ -70,7 +70,10 @@ defmodule Slither.MixProject do
     [
       main: "Slither",
       source_ref: "v#{@version}",
-      source_url: @source_url
+      source_url: @source_url,
+      logo: "assets/slither.svg",
+      extras: ["README.md"],
+      assets: %{"assets" => "assets"}
     ]
   end
 end
