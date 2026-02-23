@@ -64,6 +64,13 @@ Skip pure-Python baseline comparison:
 mix slither.example --no-baseline
 ```
 
+Run only the pure-Python baseline harness:
+
+```bash
+mix slither.baseline text_analysis
+mix slither.baseline --all
+```
+
 ## Minimal Pipe
 
 ```elixir

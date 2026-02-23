@@ -15,6 +15,7 @@ defmodule Mix.Tasks.Slither.Example do
       mix slither.example text_analysis    # Run a specific example
       mix slither.example --all            # Run all stdlib examples (1-3)
       mix slither.example --no-baseline    # Skip pure-Python baseline comparison
+      mix slither.baseline text_analysis   # Run baseline only (no Slither pipeline)
 
   ## Available Examples
 
@@ -144,6 +145,7 @@ defmodule Mix.Tasks.Slither.Example do
     Mix.shell().info("\nRun with: mix slither.example <name>")
     Mix.shell().info("Run all stdlib examples: mix slither.example --all")
     Mix.shell().info("Skip baseline comparison: mix slither.example --no-baseline\n")
+    Mix.shell().info("Run baseline only: mix slither.baseline <name>\n")
   end
 
   defp run_example(name, baseline?) do

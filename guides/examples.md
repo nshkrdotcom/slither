@@ -29,6 +29,10 @@ mix slither.example --all
 
 # Skip baseline comparison
 mix slither.example --no-baseline
+
+# Run baseline harness only (no Slither pipeline)
+mix slither.baseline text_analysis
+mix slither.baseline --all
 ```
 
 ## Baseline Runtime Rules
