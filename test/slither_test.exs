@@ -1,5 +1,5 @@
 defmodule SlitherTest do
-  use ExUnit.Case, async: true
+  use Supertester.ExUnitFoundation, isolation: :full_isolation
 
   test "dispatch/2 delegates to Slither.Dispatch.run/2" do
     items = Slither.Item.wrap_many([1, 2, 3])

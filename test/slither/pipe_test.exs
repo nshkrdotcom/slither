@@ -1,5 +1,5 @@
 defmodule Slither.PipeTest do
-  use ExUnit.Case
+  use Supertester.ExUnitFoundation, isolation: :full_isolation
 
   alias Slither.Pipe.Runner
 

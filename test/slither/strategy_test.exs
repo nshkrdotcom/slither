@@ -1,5 +1,5 @@
 defmodule Slither.StrategyTest do
-  use ExUnit.Case, async: true
+  use Supertester.ExUnitFoundation, isolation: :full_isolation
 
   alias Slither.Dispatch.Strategies.{FixedBatch, KeyPartition, WeightedBatch}
   alias Slither.Item

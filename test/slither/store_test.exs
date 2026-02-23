@@ -1,18 +1,20 @@
 defmodule Slither.StoreTest do
-  use ExUnit.Case
+  use Supertester.ExUnitFoundation, isolation: :full_isolation
+
+  import Supertester.Assertions, only: [assert_process_alive: 1]
+  import Supertester.OTPHelpers, only: [setup_isolated_genserver: 3]
 
   alias Slither.Store.Server
 
   setup do
-    # Start a fresh store for each test
     {:ok, pid} =
-      Server.start_link(
-        module: Slither.TestStore,
-        name: :"test_store_#{System.unique_integer([:positive])}"
-      )
+      setup_isolated_genserver(Server, "slither_store", init_args: Slither.TestStore)
 
-    # Give the async loader time to finish
-    Process.sleep(50)
+    assert_process_alive(pid)
+
+    # A synchronous write guarantees handle_continue(:load) has already run.
+    :ok = Server.put(pid, :test_data, "__ready__", true)
+    :ok = Server.delete(pid, :test_data, "__ready__")
 
     %{pid: pid}
   end

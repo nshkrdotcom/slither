@@ -1,5 +1,5 @@
 defmodule Slither.StageTest do
-  use ExUnit.Case, async: true
+  use Supertester.ExUnitFoundation, isolation: :full_isolation
 
   alias Slither.{Context, Item}
   alias Slither.Stage.{Beam, Python, Router}

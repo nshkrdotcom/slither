@@ -1,5 +1,5 @@
 defmodule Slither.ItemTest do
-  use ExUnit.Case, async: true
+  use Supertester.ExUnitFoundation, isolation: :full_isolation
 
   alias Slither.Item
 
