@@ -7,10 +7,10 @@
 </p>
 
 <p align="center">
-  <a href="https://hex.pm/packages/slither"><img src="https://img.shields.io/hexpm/v/slither.svg?style=flat-square&color=6e4aff" alt="Hex.pm"/></a>
-  <a href="https://hexdocs.pm/slither"><img src="https://img.shields.io/badge/docs-hexdocs-7c4dff.svg?style=flat-square" alt="HexDocs"/></a>
+  <a href="https://hex.pm/packages/slither"><img src="https://img.shields.io/hexpm/v/slither.svg?style=flat-square&color=8b1e3f" alt="Hex.pm"/></a>
+  <a href="https://hexdocs.pm/slither"><img src="https://img.shields.io/badge/docs-hexdocs-4cb8a4.svg?style=flat-square" alt="HexDocs"/></a>
   <a href="https://github.com/nshkrdotcom/slither/actions"><img src="https://img.shields.io/github/actions/workflow/status/nshkrdotcom/slither/ci.yml?style=flat-square&label=CI" alt="CI"/></a>
-  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/license-MIT-00e5a0.svg?style=flat-square" alt="License"/></a>
+  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/license-MIT-c9a227.svg?style=flat-square" alt="License"/></a>
 </p>
 
 ---

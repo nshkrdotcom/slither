@@ -49,7 +49,7 @@ defmodule Slither.Pipe.Builder do
       def __pipe_definition__ do
         var!(slither_stages) = []
         var!(slither_stores) = %{}
-        var!(slither_outputs) = MapSet.new([:default])
+        var!(slither_outputs) = [:default]
         var!(slither_errors) = %{}
 
         unquote(block)
@@ -58,7 +58,7 @@ defmodule Slither.Pipe.Builder do
           name: unquote(name),
           stages: Enum.reverse(var!(slither_stages)),
           stores: var!(slither_stores),
-          outputs: var!(slither_outputs),
+          outputs: MapSet.new(var!(slither_outputs)),
           error_policy: var!(slither_errors)
         }
       end
@@ -82,7 +82,7 @@ defmodule Slither.Pipe.Builder do
 
   defmacro output(name) do
     quote do
-      var!(slither_outputs) = MapSet.put(var!(slither_outputs), unquote(name))
+      var!(slither_outputs) = [unquote(name) | var!(slither_outputs)]
     end
   end
 

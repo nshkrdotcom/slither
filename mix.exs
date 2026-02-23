@@ -20,7 +20,10 @@ defmodule Slither.MixProject do
 
       # Docs
       name: "Slither",
-      docs: docs()
+      docs: docs(),
+
+      # Dialyzer must include :mix because this project ships Mix tasks.
+      dialyzer: [plt_add_apps: [:mix]]
     ]
   end
 
@@ -72,7 +75,30 @@ defmodule Slither.MixProject do
       source_ref: "v#{@version}",
       source_url: @source_url,
       logo: "assets/slither.svg",
-      extras: ["README.md"],
+      extras: [
+        "README.md",
+        "guides/getting-started.md",
+        "guides/architecture.md",
+        "guides/store.md",
+        "guides/dispatch.md",
+        "guides/stages.md",
+        "guides/pipe.md",
+        "guides/examples.md",
+        "guides/operations.md"
+      ],
+      groups_for_extras: [
+        Introduction: ["README.md"],
+        Guides: [
+          "guides/getting-started.md",
+          "guides/architecture.md",
+          "guides/store.md",
+          "guides/dispatch.md",
+          "guides/stages.md",
+          "guides/pipe.md",
+          "guides/operations.md"
+        ],
+        Examples: ["guides/examples.md"]
+      ],
       assets: %{"assets" => "assets"}
     ]
   end
