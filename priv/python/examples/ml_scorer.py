@@ -96,6 +96,7 @@ def train_model(items):
             "classes": [int(c) if isinstance(c, (int, float, np.integer)) else c
                         for c in model.classes_.tolist()],
             "n_features": int(X_arr.shape[1]),
+            "n_samples": int(X_arr.shape[0]),
             "accuracy": round(accuracy, 4),
             "worker_id": _worker_id,
         }]

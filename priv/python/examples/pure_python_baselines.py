@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """
-Pure-Python threaded baselines for Slither examples.
+Pure-Python comparison harness for Slither examples.
 
-Each baseline shares mutable state across threads WITHOUT locks to demonstrate
-corruption under free-threaded Python (PEP 703). No artificial sleeps or yields —
-races come from real concurrent access on real threads.
+Each example is implemented in two modes:
 
-Designed for an i9-12900KS (24 threads) with 48 threads to match Slither's
-worker count (2x oversubscription).
+1) unsafe_threaded
+   Intentionally naive threaded/shared-state approach.
 
-Usage:
-    python3.14t pure_python_baselines.py text_analysis
-    python3.14t pure_python_baselines.py --all
-    python3.14t pure_python_baselines.py text_analysis --threads 48 --rounds 5
+2) safe_python
+   Pure-Python solution with explicit synchronization and/or bounded
+   concurrency so correctness invariants hold under free-threaded Python.
+
+The goal is long-term, reproducible, apples-to-apples comparisons:
+- same core workload shape as each Slither demo
+- explicit invariant checks
+- no hardcoded outcomes
+- explicit interpreter mode reporting
 """
 
 from __future__ import annotations
@@ -21,450 +24,27 @@ import argparse
 import concurrent.futures
 import math
 import random
+import sys
 import sysconfig
 import threading
 import time
 from collections import Counter
+from dataclasses import dataclass
+from typing import Callable
 
 
 # ---------------------------------------------------------------------------
-# Free-threaded Python detection
+# Runtime helpers
 # ---------------------------------------------------------------------------
+
 
 def _is_free_threaded() -> bool:
     return bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
 
 
-def _print_gil_status() -> None:
-    if _is_free_threaded():
-        print("  Python: free-threaded (GIL disabled) -- races will manifest naturally")
-    else:
-        print("  WARNING: Running under GIL -- races may not manifest")
-        print("  Install free-threaded Python: uv python install cpython-3.14.0+freethreaded")
+def _python_mode_label() -> str:
+    return "free-threaded" if _is_free_threaded() else "gil"
 
-
-# ---------------------------------------------------------------------------
-# text_analysis baseline — 5,000 docs, 48 threads, 5 rounds
-#
-# Race: dict[key] += count from 48 threads = lost updates on shared_index
-#       shared_doc_count read-modify-write = lost increments
-# ---------------------------------------------------------------------------
-
-TEXT_VOCAB = [
-    "good", "bad", "excellent", "terrible", "service", "quality",
-    "today", "result", "happy", "sad", "amazing", "awful",
-    "fast", "slow", "reliable", "broken", "love", "hate",
-    "recommend", "avoid",
-]
-
-
-def _text_analysis_baseline(threads: int = 48, rounds: int = 5) -> tuple[bool, list[str]]:
-    random.seed(42)
-    num_docs = 5000
-
-    docs = [
-        [random.choice(TEXT_VOCAB) for _ in range(random.randint(20, 60))]
-        for _ in range(num_docs)
-    ]
-
-    shared_index: dict[str, int] = {}
-    shared_doc_count = 0
-
-    def worker(chunk: list[list[str]]) -> None:
-        nonlocal shared_doc_count
-        for _ in range(rounds):
-            for words in chunk:
-                local = Counter(words)
-                for word, count in local.items():
-                    # Race: read-modify-write on shared dict
-                    current = shared_index.get(word, 0)
-                    shared_index[word] = current + count
-                # Race: read-modify-write on shared counter
-                current = shared_doc_count
-                shared_doc_count = current + 1
-
-    chunks = [docs[i::threads] for i in range(threads)]
-
-    t0 = time.monotonic()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as pool:
-        futures = [pool.submit(worker, chunk) for chunk in chunks]
-        for future in futures:
-            future.result()
-    elapsed = time.monotonic() - t0
-
-    # Ground truth
-    expected_counter: Counter[str] = Counter()
-    for _ in range(rounds):
-        for words in docs:
-            expected_counter.update(words)
-
-    expected_docs = num_docs * rounds
-    observed_docs = shared_doc_count
-    expected_total = sum(expected_counter.values())
-    observed_total = sum(shared_index.values())
-    lost_docs = expected_docs - observed_docs
-    lost_words = expected_total - observed_total
-
-    corrupted = observed_docs != expected_docs or observed_total != expected_total
-
-    details = [
-        f"docs: expected={expected_docs} observed={observed_docs} lost={lost_docs} ({_pct(lost_docs, expected_docs)}%)",
-        f"words: expected={expected_total} observed={observed_total} lost={lost_words} ({_pct(lost_words, expected_total)}%)",
-        f"vocab: expected={len(expected_counter)} observed={len(shared_index)}",
-        f"threads={threads} rounds={rounds} elapsed={elapsed:.2f}s",
-    ]
-
-    return corrupted, details
-
-
-# ---------------------------------------------------------------------------
-# batch_stats baseline — 2,000 datasets, 48 threads, 3 rounds
-#
-# Race: Welford online accumulator (n/mean/m2) has multi-step
-#       read-modify-write — interleaving corrupts all three.
-# ---------------------------------------------------------------------------
-
-def _batch_stats_baseline(threads: int = 48, rounds: int = 3) -> tuple[bool, list[str]]:
-    random.seed(137)
-    num_datasets = 2000
-
-    datasets = [
-        [random.uniform(1.0, 1000.0) for _ in range(random.randint(5, 100))]
-        for _ in range(num_datasets)
-    ]
-
-    # Shared Welford accumulator — textbook race target
-    running = {"n": 0, "mean": 0.0, "m2": 0.0}
-
-    def worker(chunk: list[list[float]]) -> None:
-        for _ in range(rounds):
-            for values in chunk:
-                for x in values:
-                    # Multi-step read-modify-write: n, mean, m2
-                    n0 = running["n"]
-                    n1 = n0 + 1
-                    running["n"] = n1
-
-                    mean0 = running["mean"]
-                    delta = x - mean0
-                    mean1 = mean0 + delta / n1
-                    running["mean"] = mean1
-
-                    m20 = running["m2"]
-                    delta2 = x - mean1
-                    running["m2"] = m20 + delta * delta2
-
-    chunks = [datasets[i::threads] for i in range(threads)]
-
-    t0 = time.monotonic()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as pool:
-        futures = [pool.submit(worker, chunk) for chunk in chunks]
-        for future in futures:
-            future.result()
-    elapsed = time.monotonic() - t0
-
-    # Ground truth
-    all_values: list[float] = []
-    for _ in range(rounds):
-        for values in datasets:
-            all_values.extend(values)
-
-    expected_n = len(all_values)
-    expected_mean = sum(all_values) / expected_n
-    expected_var = sum((x - expected_mean) ** 2 for x in all_values) / expected_n
-
-    observed_n = running["n"]
-    observed_mean = running["mean"]
-    observed_var = running["m2"] / max(observed_n, 1)
-
-    n_diff = expected_n - observed_n
-    mean_diff = abs(expected_mean - observed_mean)
-    var_diff = abs(expected_var - observed_var)
-
-    corrupted = observed_n != expected_n or mean_diff > 1e-6 or var_diff > 1e-6
-
-    details = [
-        f"n: expected={expected_n} observed={observed_n} lost={n_diff} ({_pct(n_diff, expected_n)}%)",
-        f"mean: expected={expected_mean:.4f} observed={observed_mean:.4f} diff={mean_diff:.4f}",
-        f"variance: expected={expected_var:.4f} observed={observed_var:.4f} diff={var_diff:.4f}",
-        f"threads={threads} rounds={rounds} elapsed={elapsed:.2f}s",
-    ]
-
-    return corrupted, details
-
-
-# ---------------------------------------------------------------------------
-# data_etl baseline — 10,000 rows, 48 threads, hot-reload thread
-#
-# Race: list.append() is NOT atomic without GIL. Torn reads on shared schema
-#       dict while hot-reload thread swaps fields. validation_count lost increments.
-# ---------------------------------------------------------------------------
-
-def _data_etl_baseline(threads: int = 48, rounds: int = 1) -> tuple[bool, list[str]]:
-    schema = {
-        "version": 1, "age_min": 0, "age_max": 150,
-        "name_min": 1, "email_pattern": None,
-    }
-    schema_v1 = dict(schema)
-    schema_v2 = {
-        "version": 2, "age_min": 18, "age_max": 120,
-        "name_min": 2, "email_pattern": "@",
-    }
-
-    stop_event = threading.Event()
-    num_rows = 10000
-
-    rows = [
-        {"name": f"User{i}", "age": 25 + (i % 50), "email": f"u{i}@example.com"}
-        for i in range(num_rows)
-    ]
-
-    torn_reads = 0
-    audit_log: list[dict] = []
-    validation_count = 0
-
-    def hot_reload_loop() -> None:
-        toggle = False
-        while not stop_event.is_set():
-            target = schema_v2 if toggle else schema_v1
-            # Non-atomic multi-field update — readers see partial state
-            for key in ("version", "age_min", "age_max", "name_min", "email_pattern"):
-                schema[key] = target[key]
-            toggle = not toggle
-
-    def validate_worker(chunk: list[dict]) -> None:
-        nonlocal torn_reads, validation_count
-        for _ in range(rounds):
-            for row in chunk:
-                # Read schema fields — may get mix of v1 and v2
-                version = schema["version"]
-                age_min = schema["age_min"]
-                age_max = schema["age_max"]
-                name_min = schema["name_min"]
-                email_pattern = schema["email_pattern"]
-
-                torn = False
-                if version == 1:
-                    torn = (age_min, age_max, name_min, email_pattern) != (0, 150, 1, None)
-                elif version == 2:
-                    torn = (age_min, age_max, name_min, email_pattern) != (18, 120, 2, "@")
-
-                if torn:
-                    # Race: read-modify-write on torn_reads counter
-                    current = torn_reads
-                    torn_reads = current + 1
-
-                # Race: list.append not atomic without GIL
-                audit_log.append({"version": version, "ok": not torn, "row_id": row.get("name")})
-                # Race: read-modify-write on counter
-                current = validation_count
-                validation_count = current + 1
-
-    reloader = threading.Thread(target=hot_reload_loop, daemon=True)
-    reloader.start()
-
-    chunks = [rows[i::threads] for i in range(threads)]
-
-    t0 = time.monotonic()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as pool:
-        futures = [pool.submit(validate_worker, chunk) for chunk in chunks]
-        for future in futures:
-            future.result()
-    elapsed = time.monotonic() - t0
-
-    stop_event.set()
-    reloader.join(timeout=2.0)
-
-    expected_validations = num_rows * rounds
-    audit_size = len(audit_log)
-    count_diff = expected_validations - validation_count
-    log_diff = expected_validations - audit_size
-
-    corrupted = torn_reads > 0 or validation_count != expected_validations or audit_size != expected_validations
-
-    details = [
-        f"torn_reads={torn_reads}",
-        f"validations: expected={expected_validations} observed={validation_count} lost={count_diff} ({_pct(count_diff, expected_validations)}%)",
-        f"audit_log: expected={expected_validations} observed={audit_size} lost={log_diff} ({_pct(log_diff, expected_validations)}%)",
-        f"threads={threads} rounds={rounds} elapsed={elapsed:.2f}s",
-    ]
-
-    return corrupted, details
-
-
-# ---------------------------------------------------------------------------
-# ml_scoring baseline — 2 sessions, shared models dict, 48 predict threads
-#
-# Race: Two sessions train into shared models["active"] — last writer wins.
-#       48 predict threads read from corrupted shared state.
-#       _prediction_count read-modify-write race.
-# ---------------------------------------------------------------------------
-
-def _ml_scoring_baseline(threads: int = 48, rounds: int = 1) -> tuple[bool, list[str]]:
-    random.seed(42)
-
-    # Shared model storage — no session isolation
-    models: dict[str, dict] = {}
-    prediction_count = 0
-
-    num_train = 2000
-    num_test = 2000
-
-    # Generate training data for two sessions with different distributions
-    train_a = [(random.gauss(2.0, 1.0), random.gauss(2.0, 1.0)) for _ in range(num_train)]
-    train_b = [(random.gauss(7.0, 1.0), random.gauss(7.0, 1.0)) for _ in range(num_train)]
-
-    def train_model(session_id: str, data: list[tuple[float, float]], center: float) -> None:
-        # Simulate training by computing a simple threshold model
-        model = {
-            "session": session_id,
-            "center": center,
-            "n_samples": len(data),
-            "mean_x": sum(d[0] for d in data) / len(data),
-            "mean_y": sum(d[1] for d in data) / len(data),
-        }
-        # Race: both sessions write to same key
-        models["active"] = model
-
-    def predict_worker(test_data: list[tuple[float, float]]) -> list[int]:
-        nonlocal prediction_count
-        results = []
-        for x, y in test_data:
-            model = models.get("active", {})
-            center = model.get("center", 5.0)
-            pred = 1 if (x + y) / 2 >= center else 0
-            results.append(pred)
-            # Race: read-modify-write
-            current = prediction_count
-            prediction_count = current + 1
-        return results
-
-    test_data = [(random.gauss(5.0, 3.0), random.gauss(5.0, 3.0)) for _ in range(num_test)]
-
-    # Train concurrently — race on models["active"]
-    t0 = time.monotonic()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        fa = pool.submit(train_model, "session_a", train_a, 2.0)
-        fb = pool.submit(train_model, "session_b", train_b, 7.0)
-        fa.result()
-        fb.result()
-
-    # What would isolated predictions look like?
-    expected_a = [1 if (x + y) / 2 >= 2.0 else 0 for x, y in test_data]
-    expected_b = [1 if (x + y) / 2 >= 7.0 else 0 for x, y in test_data]
-    expected_divergence = sum(1 for a, b in zip(expected_a, expected_b) if a != b)
-
-    # Predict from shared (corrupted) state — all threads see same model
-    chunks = [test_data[i::threads] for i in range(threads)]
-    all_preds: list[int] = []
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as pool:
-        futures = [pool.submit(predict_worker, chunk) for chunk in chunks]
-        for future in futures:
-            all_preds.extend(future.result())
-    elapsed = time.monotonic() - t0
-
-    # Since both sessions wrote to same key, predictions are identical
-    observed_divergence = 0  # all preds use same model
-    shared_model = models.get("active", {})
-    expected_pred_count = num_test
-    lost_preds = expected_pred_count - prediction_count
-
-    corrupted = observed_divergence < expected_divergence or prediction_count != expected_pred_count
-
-    details = [
-        f"session_isolation: expected_divergence={expected_divergence} observed_divergence={observed_divergence}",
-        f"shared_model_owner={shared_model.get('session', '?')} center={shared_model.get('center', '?')}",
-        f"predictions: expected={expected_pred_count} observed={prediction_count} lost={lost_preds} ({_pct(lost_preds, expected_pred_count)}%)",
-        f"train_samples={num_train}x2 test_records={num_test} threads={threads} elapsed={elapsed:.2f}s",
-    ]
-
-    return corrupted, details
-
-
-# ---------------------------------------------------------------------------
-# image_pipeline baseline — 200 images, 48 threads, no backpressure
-#
-# Race: in_flight / peak tracking via read-modify-write.
-#       No backpressure = all 200 images in-flight simultaneously.
-# ---------------------------------------------------------------------------
-
-def _image_pipeline_baseline(threads: int = 48, rounds: int = 1) -> tuple[bool, list[str]]:
-    # 200 images: 50 small, 80 medium, 50 large (1080p), 20 XL (4K)
-    image_specs: list[int] = []
-    image_specs.extend([200 * 150] * 50)     # small
-    image_specs.extend([800 * 600] * 80)     # medium
-    image_specs.extend([1920 * 1080] * 50)   # large (1080p)
-    image_specs.extend([3840 * 2160] * 20)   # XL (4K)
-
-    in_flight = 0
-    peak_in_flight = 0
-    current_bytes = 0
-    peak_bytes = 0
-
-    def process_image(pixel_count: int) -> int:
-        nonlocal in_flight, peak_in_flight, current_bytes, peak_bytes
-
-        # Allocate memory proportional to image size (3 bytes/pixel for RGB)
-        mem_size = pixel_count * 3
-        buf = bytearray(mem_size)
-
-        # Race: read-modify-write on all counters
-        current_in = in_flight
-        in_flight = current_in + 1
-        current_b = current_bytes
-        current_bytes = current_b + mem_size
-        peak_in = peak_in_flight
-        peak_in_flight = max(peak_in, in_flight)
-        peak_b = peak_bytes
-        peak_bytes = max(peak_b, current_bytes)
-
-        # Simulate resize work — iterate over pixels to create a real
-        # contention window (threads stay in-flight longer)
-        thumb_size = max(1, pixel_count // 64)
-        thumb = bytearray(thumb_size * 3)
-        # Downsample: strided copy from source buffer
-        stride = max(1, len(buf) // len(thumb))
-        for i in range(len(thumb)):
-            thumb[i] = buf[i * stride % len(buf)]
-
-        # Release
-        current_in = in_flight
-        in_flight = current_in - 1
-        current_b = current_bytes
-        current_bytes = current_b - mem_size
-
-        del buf
-        return thumb_size
-
-    t0 = time.monotonic()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as pool:
-        futures = [pool.submit(process_image, px) for px in image_specs]
-        for future in futures:
-            future.result()
-    elapsed = time.monotonic() - t0
-
-    total_pixels = sum(image_specs)
-    megapixels = total_pixels / 1_000_000
-    bounded_in_flight_target = 4
-    bounded_memory_mb = 50.0
-    peak_mb = peak_bytes / (1024 * 1024)
-
-    corrupted = peak_in_flight > bounded_in_flight_target or peak_mb > bounded_memory_mb
-
-    details = [
-        f"images={len(image_specs)} total_megapixels={megapixels:.1f}",
-        f"peak_in_flight={peak_in_flight} (bounded_target={bounded_in_flight_target})",
-        f"peak_memory={peak_mb:.1f}MB (bounded_target={bounded_memory_mb:.1f}MB)",
-        f"threads={threads} elapsed={elapsed:.2f}s",
-    ]
-
-    return corrupted, details
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _pct(diff: int, total: int) -> str:
     if total == 0:
@@ -472,79 +52,1336 @@ def _pct(diff: int, total: int) -> str:
     return f"{abs(diff) / total * 100:.1f}"
 
 
+def _run_timed(fn: Callable[[], tuple[bool, list[str]]]) -> tuple[bool, list[str], float]:
+    t0 = time.monotonic()
+    ok, details = fn()
+    return ok, details, time.monotonic() - t0
+
+
+def _chunk_strided(items: list, workers: int) -> list[list]:
+    if workers <= 0:
+        raise ValueError("workers must be positive")
+    return [items[i::workers] for i in range(workers)]
+
+
 # ---------------------------------------------------------------------------
-# Runner
+# Shared result model
 # ---------------------------------------------------------------------------
 
-RUNNERS = {
-    "text_analysis": _text_analysis_baseline,
-    "batch_stats": _batch_stats_baseline,
-    "data_etl": _data_etl_baseline,
-    "ml_scoring": _ml_scoring_baseline,
-    "image_pipeline": _image_pipeline_baseline,
+
+@dataclass
+class ModeResult:
+    mode: str
+    ok: bool
+    details: list[str]
+    elapsed_s: float
+
+
+# ---------------------------------------------------------------------------
+# Example 1: text_analysis (5,000 docs)
+# ---------------------------------------------------------------------------
+
+TEXT_VOCAB = [
+    "good",
+    "bad",
+    "excellent",
+    "terrible",
+    "service",
+    "quality",
+    "today",
+    "result",
+    "happy",
+    "sad",
+    "amazing",
+    "awful",
+    "fast",
+    "slow",
+    "reliable",
+    "broken",
+    "love",
+    "hate",
+    "recommend",
+    "avoid",
+    "product",
+    "team",
+    "experience",
+    "delivery",
+    "price",
+    "support",
+    "feedback",
+    "performance",
+    "design",
+    "usability",
+    "innovation",
+    "problem",
+    "solution",
+    "customer",
+    "value",
+    "improve",
+]
+
+
+def _build_text_docs(seed: int = 42, num_docs: int = 5000) -> list[list[str]]:
+    rng = random.Random(seed)
+    docs: list[list[str]] = []
+
+    for _ in range(num_docs):
+        word_count = 15 + rng.randint(1, 50)  # 16..65, same shape as Elixir demo
+        docs.append([rng.choice(TEXT_VOCAB) for _ in range(word_count)])
+
+    return docs
+
+
+def _text_analysis_unsafe(threads: int) -> tuple[bool, list[str]]:
+    docs = _build_text_docs()
+
+    expected_counter: Counter[str] = Counter()
+    for words in docs:
+        expected_counter.update(words)
+
+    expected_docs = len(docs)
+    expected_words = sum(expected_counter.values())
+
+    shared_index: dict[str, int] = {}
+    shared_doc_count = 0
+
+    def worker(chunk: list[list[str]]) -> None:
+        nonlocal shared_doc_count
+        for words in chunk:
+            local = Counter(words)
+            for word, count in local.items():
+                # Intentional read-modify-write race in unsafe mode
+                current = shared_index.get(word, 0)
+                shared_index[word] = current + count
+
+            # Intentional read-modify-write race in unsafe mode
+            current = shared_doc_count
+            shared_doc_count = current + 1
+
+    chunks = _chunk_strided(docs, threads)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as pool:
+        futures = [pool.submit(worker, chunk) for chunk in chunks]
+        for fut in futures:
+            fut.result()
+
+    observed_docs = shared_doc_count
+    observed_words = sum(shared_index.values())
+    lost_docs = expected_docs - observed_docs
+    lost_words = expected_words - observed_words
+
+    ok = (
+        observed_docs == expected_docs
+        and observed_words == expected_words
+        and len(shared_index) == len(expected_counter)
+    )
+
+    details = [
+        f"docs: expected={expected_docs} observed={observed_docs} lost={lost_docs} ({_pct(lost_docs, expected_docs)}%)",
+        f"words: expected={expected_words} observed={observed_words} lost={lost_words} ({_pct(lost_words, expected_words)}%)",
+        f"vocab: expected={len(expected_counter)} observed={len(shared_index)}",
+        "hazard: lock-free shared dict/counter updates",
+    ]
+    return ok, details
+
+
+def _text_analysis_safe(threads: int) -> tuple[bool, list[str]]:
+    docs = _build_text_docs()
+
+    expected_counter: Counter[str] = Counter()
+    for words in docs:
+        expected_counter.update(words)
+
+    expected_docs = len(docs)
+    expected_words = sum(expected_counter.values())
+
+    def worker(chunk: list[list[str]]) -> tuple[Counter[str], int]:
+        local_counter: Counter[str] = Counter()
+        local_docs = 0
+
+        for words in chunk:
+            local_counter.update(words)
+            local_docs += 1
+
+        return local_counter, local_docs
+
+    chunks = _chunk_strided(docs, threads)
+
+    merged_counter: Counter[str] = Counter()
+    merged_docs = 0
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as pool:
+        futures = [pool.submit(worker, chunk) for chunk in chunks]
+        for fut in futures:
+            local_counter, local_docs = fut.result()
+            merged_counter.update(local_counter)
+            merged_docs += local_docs
+
+    observed_docs = merged_docs
+    observed_words = sum(merged_counter.values())
+    lost_docs = expected_docs - observed_docs
+    lost_words = expected_words - observed_words
+
+    ok = (
+        observed_docs == expected_docs
+        and observed_words == expected_words
+        and merged_counter == expected_counter
+    )
+
+    details = [
+        f"docs: expected={expected_docs} observed={observed_docs} lost={lost_docs} ({_pct(lost_docs, expected_docs)}%)",
+        f"words: expected={expected_words} observed={observed_words} lost={lost_words} ({_pct(lost_words, expected_words)}%)",
+        f"vocab: expected={len(expected_counter)} observed={len(merged_counter)}",
+        "solution: thread-local Counters merged deterministically",
+    ]
+    return ok, details
+
+
+# ---------------------------------------------------------------------------
+# Example 2: batch_stats (2,000 datasets + 50 poison pills)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RunningStats:
+    n: int = 0
+    mean: float = 0.0
+    m2: float = 0.0
+
+    def update(self, value: float) -> None:
+        self.n += 1
+        delta = value - self.mean
+        self.mean += delta / self.n
+        delta2 = value - self.mean
+        self.m2 += delta * delta2
+
+    def merge(self, other: "RunningStats") -> None:
+        if other.n == 0:
+            return
+        if self.n == 0:
+            self.n = other.n
+            self.mean = other.mean
+            self.m2 = other.m2
+            return
+
+        delta = other.mean - self.mean
+        total_n = self.n + other.n
+
+        self.m2 = self.m2 + other.m2 + delta * delta * self.n * other.n / total_n
+        self.mean = (self.mean * self.n + other.mean * other.n) / total_n
+        self.n = total_n
+
+    @property
+    def variance(self) -> float:
+        if self.n == 0:
+            return 0.0
+        return self.m2 / self.n
+
+
+def _generate_batch_datasets(seed: int = 137) -> list[dict]:
+    rng = random.Random(seed)
+
+    def make_dataset(data_type: str, min_size: int, max_size: int) -> dict:
+        size = rng.randint(min_size, max_size)
+        values = [rng.uniform(1.0, 1000.0) for _ in range(size)]
+        return {"values": values, "data_type": data_type}
+
+    datasets: list[dict] = []
+    datasets.extend(make_dataset("small", 5, 10) for _ in range(800))
+    datasets.extend(make_dataset("medium", 50, 100) for _ in range(800))
+    datasets.extend(make_dataset("large", 200, 500) for _ in range(350))
+
+    # Same poison shape as Slither demo (20 nil, 20 NaN-string, 10 empty)
+    datasets.extend({"values": [1.0, 2.0, None, 4.0, None, 6.0], "data_type": "poison"} for _ in range(20))
+    datasets.extend({"values": [10.0, "NaN", 30.0, "NaN", 50.0], "data_type": "poison"} for _ in range(20))
+    datasets.extend({"values": [], "data_type": "poison"} for _ in range(10))
+
+    rng.shuffle(datasets)
+    return datasets
+
+
+def _numeric_values_or_none(values: list) -> list[float] | None:
+    if not values:
+        return None
+
+    cleaned: list[float] = []
+
+    for value in values:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return None
+        if not isinstance(value, (int, float)):
+            return None
+        if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+            return None
+        cleaned.append(float(value))
+
+    return cleaned
+
+
+def _expected_batch_stats(datasets: list[dict]) -> tuple[RunningStats, int, int]:
+    stats = RunningStats()
+    skipped = 0
+    processed = 0
+
+    for dataset in datasets:
+        values = _numeric_values_or_none(dataset.get("values", []))
+        if values is None:
+            skipped += 1
+            continue
+
+        processed += 1
+        for x in values:
+            stats.update(x)
+
+    return stats, skipped, processed
+
+
+def _batch_stats_unsafe(threads: int) -> tuple[bool, list[str]]:
+    datasets = _generate_batch_datasets()
+    expected, expected_skipped, expected_processed = _expected_batch_stats(datasets)
+
+    running = {"n": 0, "mean": 0.0, "m2": 0.0}
+    skipped = 0
+    processed = 0
+
+    def worker(chunk: list[dict]) -> None:
+        nonlocal skipped, processed
+
+        for dataset in chunk:
+            values = _numeric_values_or_none(dataset.get("values", []))
+            if values is None:
+                # Intentional read-modify-write race in unsafe mode
+                current = skipped
+                skipped = current + 1
+                continue
+
+            current = processed
+            processed = current + 1
+
+            for x in values:
+                # Intentional lock-free Welford updates in unsafe mode
+                n0 = running["n"]
+                n1 = n0 + 1
+                running["n"] = n1
+
+                mean0 = running["mean"]
+                delta = x - mean0
+                mean1 = mean0 + delta / n1
+                running["mean"] = mean1
+
+                m20 = running["m2"]
+                delta2 = x - mean1
+                running["m2"] = m20 + delta * delta2
+
+    chunks = _chunk_strided(datasets, threads)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as pool:
+        futures = [pool.submit(worker, chunk) for chunk in chunks]
+        for fut in futures:
+            fut.result()
+
+    observed = RunningStats(n=running["n"], mean=running["mean"], m2=running["m2"])
+
+    n_diff = expected.n - observed.n
+    mean_diff = abs(expected.mean - observed.mean)
+    var_diff = abs(expected.variance - observed.variance)
+
+    ok = (
+        observed.n == expected.n
+        and mean_diff <= 1e-9
+        and var_diff <= 1e-9
+        and skipped == expected_skipped
+        and processed == expected_processed
+    )
+
+    details = [
+        f"n: expected={expected.n} observed={observed.n} lost={n_diff} ({_pct(n_diff, expected.n)}%)",
+        f"mean: expected={expected.mean:.6f} observed={observed.mean:.6f} diff={mean_diff:.6f}",
+        f"variance: expected={expected.variance:.6f} observed={observed.variance:.6f} diff={var_diff:.6f}",
+        f"processed: expected={expected_processed} observed={processed}",
+        f"skipped(poison): expected={expected_skipped} observed={skipped}",
+        "hazard: lock-free shared Welford accumulator",
+    ]
+    return ok, details
+
+
+def _batch_stats_safe(threads: int) -> tuple[bool, list[str]]:
+    datasets = _generate_batch_datasets()
+    expected, expected_skipped, expected_processed = _expected_batch_stats(datasets)
+
+    def worker(chunk: list[dict]) -> tuple[RunningStats, int, int]:
+        local_stats = RunningStats()
+        local_skipped = 0
+        local_processed = 0
+
+        for dataset in chunk:
+            values = _numeric_values_or_none(dataset.get("values", []))
+            if values is None:
+                local_skipped += 1
+                continue
+
+            local_processed += 1
+            for x in values:
+                local_stats.update(x)
+
+        return local_stats, local_skipped, local_processed
+
+    chunks = _chunk_strided(datasets, threads)
+
+    observed = RunningStats()
+    skipped = 0
+    processed = 0
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as pool:
+        futures = [pool.submit(worker, chunk) for chunk in chunks]
+        for fut in futures:
+            local_stats, local_skipped, local_processed = fut.result()
+            observed.merge(local_stats)
+            skipped += local_skipped
+            processed += local_processed
+
+    n_diff = expected.n - observed.n
+    mean_diff = abs(expected.mean - observed.mean)
+    var_diff = abs(expected.variance - observed.variance)
+
+    ok = (
+        observed.n == expected.n
+        and mean_diff <= 1e-9
+        and var_diff <= 1e-9
+        and skipped == expected_skipped
+        and processed == expected_processed
+    )
+
+    details = [
+        f"n: expected={expected.n} observed={observed.n} lost={n_diff} ({_pct(n_diff, expected.n)}%)",
+        f"mean: expected={expected.mean:.6f} observed={observed.mean:.6f} diff={mean_diff:.6f}",
+        f"variance: expected={expected.variance:.6f} observed={observed.variance:.6f} diff={var_diff:.6f}",
+        f"processed: expected={expected_processed} observed={processed}",
+        f"skipped(poison): expected={expected_skipped} observed={skipped}",
+        "solution: thread-local Welford accumulators + deterministic merge",
+    ]
+    return ok, details
+
+
+# ---------------------------------------------------------------------------
+# Example 3: data_etl (15,000 rows over 3 phases, schema hot-reload)
+# ---------------------------------------------------------------------------
+
+NAMES = [
+    "Alice",
+    "Bob",
+    "Charlie",
+    "Diana",
+    "Eve",
+    "Frank",
+    "Grace",
+    "Hank",
+    "Irene",
+    "Jack",
+    "Karen",
+    "Leo",
+    "Mona",
+    "Nate",
+    "Oscar",
+    "Paula",
+    "Quinn",
+    "Rita",
+    "Steve",
+    "Tina",
+    "Uma",
+    "Victor",
+    "Wendy",
+    "Xavier",
+    "Yara",
+    "Zane",
+    "Amber",
+    "Blake",
+    "Casey",
+    "Drew",
+]
+
+SCHEMA_V1 = {
+    "version": 1,
+    "name_min": 1,
+    "age_min": 0,
+    "age_max": 150,
+    "email_required": False,
+    "email_pattern": None,
+}
+
+SCHEMA_V2 = {
+    "version": 2,
+    "name_min": 2,
+    "age_min": 18,
+    "age_max": 120,
+    "email_required": True,
+    "email_pattern": "@",
 }
 
 
-def _run_one(name: str, threads: int, rounds: int | None) -> int:
-    if name not in RUNNERS:
-        print(f"Unknown baseline target: {name}")
-        return 2
+def _schema_signature(schema: dict) -> tuple:
+    return (
+        schema["version"],
+        schema["name_min"],
+        schema["age_min"],
+        schema["age_max"],
+        schema["email_required"],
+        schema["email_pattern"],
+    )
 
-    _print_gil_status()
 
-    fn = RUNNERS[name]
-    kwargs: dict = {"threads": threads}
-    if rounds is not None:
-        kwargs["rounds"] = rounds
+def _generate_valid_row(i: int) -> dict:
+    name = NAMES[i % len(NAMES)]
+    age = 20 + (i % 60)
+    return {
+        "name": name,
+        "age": age,
+        "email": f"{name.lower()}{i}@example.com",
+    }
 
-    corrupted, details = fn(**kwargs)
 
-    print(f"\n=== Pure Python Baseline: {name} ===")
-    for line in details:
-        print(f"  {line}")
+def _generate_invalid_row(i: int) -> dict:
+    kind = i % 4
+    if kind == 0:
+        return {"name": "", "age": 25, "email": f"empty{i}@example.com"}
+    if kind == 1:
+        return {"name": f"User{i}", "age": -5, "email": f"neg{i}@example.com"}
+    if kind == 2:
+        return {"age": 35, "email": f"noname{i}@test.com"}
+    return {"name": f"Bad{i}", "age": 200, "email": f"bad{i}@example.com"}
 
-    if corrupted:
-        print("  outcome=CORRUPTED (expected under free-threaded Python)")
-    else:
-        print("  outcome=CLEAN (races did not manifest this run)")
 
-    return corrupted
+def _generate_rows(count: int, invalid_ratio: float, seed: int) -> list[dict]:
+    rng = random.Random(seed)
+    rows: list[dict] = []
+
+    for i in range(1, count + 1):
+        if rng.random() < invalid_ratio:
+            rows.append(_generate_invalid_row(i))
+        else:
+            rows.append(_generate_valid_row(i))
+
+    return rows
+
+
+def _validate_row(row: dict, schema: dict) -> bool:
+    name = row.get("name")
+    if not isinstance(name, str) or len(name) < schema["name_min"]:
+        return False
+
+    age = row.get("age")
+    if not isinstance(age, int):
+        return False
+    if age < schema["age_min"] or age > schema["age_max"]:
+        return False
+
+    email = row.get("email")
+    if schema["email_required"]:
+        if not isinstance(email, str):
+            return False
+        pattern = schema["email_pattern"]
+        if pattern and pattern not in email:
+            return False
+
+    return True
+
+
+class _SchemaHolder:
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._schema = dict(SCHEMA_V1)
+
+    def set_schema(self, schema: dict) -> None:
+        with self._lock:
+            self._schema = dict(schema)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return dict(self._schema)
+
+
+def _data_etl_unsafe(threads: int) -> tuple[bool, list[str]]:
+    schema = dict(SCHEMA_V1)
+
+    validation_count = 0
+    valid_count = 0
+    invalid_count = 0
+    torn_reads = 0
+    audit_entries: list[tuple[int, bool]] = []
+
+    valid_sigs = {_schema_signature(SCHEMA_V1), _schema_signature(SCHEMA_V2)}
+
+    def set_schema_non_atomic(target: dict) -> None:
+        for key in ("version", "name_min", "age_min", "age_max", "email_required", "email_pattern"):
+            schema[key] = target[key]
+
+    def snapshot_non_atomic() -> dict:
+        return {
+            "version": schema["version"],
+            "name_min": schema["name_min"],
+            "age_min": schema["age_min"],
+            "age_max": schema["age_max"],
+            "email_required": schema["email_required"],
+            "email_pattern": schema["email_pattern"],
+        }
+
+    def validate_worker(chunk: list[dict]) -> None:
+        nonlocal validation_count, valid_count, invalid_count, torn_reads
+
+        for row in chunk:
+            snap = snapshot_non_atomic()
+            if _schema_signature(snap) not in valid_sigs:
+                current = torn_reads
+                torn_reads = current + 1
+
+            is_valid = _validate_row(row, snap)
+
+            # Intentional read-modify-write races in unsafe mode
+            current = validation_count
+            validation_count = current + 1
+
+            if is_valid:
+                current = valid_count
+                valid_count = current + 1
+            else:
+                current = invalid_count
+                invalid_count = current + 1
+
+            audit_entries.append((snap["version"], is_valid))
+
+    def run_batch(rows: list[dict]) -> None:
+        chunks = _chunk_strided(rows, threads)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as pool:
+            futures = [pool.submit(validate_worker, chunk) for chunk in chunks]
+            for fut in futures:
+                fut.result()
+
+    # Batch 1: v1, 5000 rows, 10% invalid
+    batch1 = _generate_rows(5000, 0.10, seed=101)
+    run_batch(batch1)
+
+    # Batch 2: switch to v2, 5000 rows, 20% invalid
+    set_schema_non_atomic(SCHEMA_V2)
+    batch2 = _generate_rows(5000, 0.20, seed=202)
+    run_batch(batch2)
+
+    # Batch 3: concurrent schema toggling, 5000 rows, 15% invalid
+    batch3 = _generate_rows(5000, 0.15, seed=303)
+
+    def toggler() -> None:
+        toggle = False
+        for _ in range(20):
+            set_schema_non_atomic(SCHEMA_V2 if toggle else SCHEMA_V1)
+            toggle = not toggle
+            time.sleep(0.005)
+
+    toggle_thread = threading.Thread(target=toggler, daemon=True)
+    toggle_thread.start()
+    run_batch(batch3)
+    toggle_thread.join(timeout=5.0)
+
+    expected_validations = 15_000
+    observed_audit = len(audit_entries)
+    consistency_diff = validation_count - (valid_count + invalid_count)
+
+    ok = (
+        torn_reads == 0
+        and validation_count == expected_validations
+        and observed_audit == expected_validations
+        and consistency_diff == 0
+    )
+
+    details = [
+        f"torn_reads={torn_reads}",
+        f"validations: expected={expected_validations} observed={validation_count} lost={expected_validations - validation_count} ({_pct(expected_validations - validation_count, expected_validations)}%)",
+        f"audit_entries: expected={expected_validations} observed={observed_audit} lost={expected_validations - observed_audit} ({_pct(expected_validations - observed_audit, expected_validations)}%)",
+        f"valid+invalid consistency diff={consistency_diff}",
+        "hazard: non-atomic schema swaps + lock-free shared counters",
+    ]
+    return ok, details
+
+
+def _data_etl_safe(threads: int) -> tuple[bool, list[str]]:
+    holder = _SchemaHolder()
+
+    counter_lock = threading.Lock()
+    validation_count = 0
+    valid_count = 0
+    invalid_count = 0
+    torn_reads = 0
+    audit_entries = 0
+
+    valid_sigs = {_schema_signature(SCHEMA_V1), _schema_signature(SCHEMA_V2)}
+
+    def validate_worker(chunk: list[dict]) -> None:
+        nonlocal validation_count, valid_count, invalid_count, torn_reads, audit_entries
+
+        for row in chunk:
+            snap = holder.snapshot()
+
+            # Should remain zero in safe mode
+            if _schema_signature(snap) not in valid_sigs:
+                with counter_lock:
+                    torn_reads += 1
+
+            is_valid = _validate_row(row, snap)
+
+            with counter_lock:
+                validation_count += 1
+                audit_entries += 1
+                if is_valid:
+                    valid_count += 1
+                else:
+                    invalid_count += 1
+
+    def run_batch(rows: list[dict]) -> None:
+        chunks = _chunk_strided(rows, threads)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as pool:
+            futures = [pool.submit(validate_worker, chunk) for chunk in chunks]
+            for fut in futures:
+                fut.result()
+
+    # Batch 1: v1
+    batch1 = _generate_rows(5000, 0.10, seed=101)
+    run_batch(batch1)
+
+    # Batch 2: v2
+    holder.set_schema(SCHEMA_V2)
+    batch2 = _generate_rows(5000, 0.20, seed=202)
+    run_batch(batch2)
+
+    # Batch 3: toggling during run
+    batch3 = _generate_rows(5000, 0.15, seed=303)
+
+    def toggler() -> None:
+        toggle = False
+        for _ in range(20):
+            holder.set_schema(SCHEMA_V2 if toggle else SCHEMA_V1)
+            toggle = not toggle
+            time.sleep(0.005)
+
+    toggle_thread = threading.Thread(target=toggler, daemon=True)
+    toggle_thread.start()
+    run_batch(batch3)
+    toggle_thread.join(timeout=5.0)
+
+    expected_validations = 15_000
+    consistency_diff = validation_count - (valid_count + invalid_count)
+
+    ok = (
+        torn_reads == 0
+        and validation_count == expected_validations
+        and audit_entries == expected_validations
+        and consistency_diff == 0
+    )
+
+    details = [
+        f"torn_reads={torn_reads}",
+        f"validations: expected={expected_validations} observed={validation_count} lost={expected_validations - validation_count} ({_pct(expected_validations - validation_count, expected_validations)}%)",
+        f"audit_entries: expected={expected_validations} observed={audit_entries} lost={expected_validations - audit_entries} ({_pct(expected_validations - audit_entries, expected_validations)}%)",
+        f"valid+invalid consistency diff={consistency_diff}",
+        "solution: locked schema snapshots + synchronized counters",
+    ]
+    return ok, details
+
+
+# ---------------------------------------------------------------------------
+# Example 4: ml_scoring (2 sessions, concurrent train+predict)
+# ---------------------------------------------------------------------------
+
+
+def _generate_training_data(seed: int, n: int, center0: float, center1: float) -> list[tuple[float, float]]:
+    rng = random.Random(seed)
+    half = n // 2
+
+    class0 = [(rng.gauss(center0, 1.0), rng.gauss(center0, 1.0)) for _ in range(half)]
+    class1 = [(rng.gauss(center1, 1.0), rng.gauss(center1, 1.0)) for _ in range(n - half)]
+
+    return class0 + class1
+
+
+def _generate_test_points(seed: int, n: int) -> list[tuple[float, float]]:
+    rng = random.Random(seed)
+    return [(rng.gauss(5.0, 3.0), rng.gauss(5.0, 3.0)) for _ in range(n)]
+
+
+def _predict_point(point: tuple[float, float], center: float) -> int:
+    return 1 if (point[0] + point[1]) / 2.0 >= center else 0
+
+
+def _ml_scoring_unsafe(threads: int) -> tuple[bool, list[str]]:
+    num_train = 2000
+    num_test = 2000
+
+    train_a = _generate_training_data(seed=42, n=num_train, center0=2.0, center1=3.0)
+    train_b = _generate_training_data(seed=43, n=num_train, center0=7.0, center1=8.0)
+    test_points = _generate_test_points(seed=99, n=num_test)
+
+    models: dict[str, dict] = {}
+    prediction_count = 0
+
+    def train_model(session_id: str, center: float, data: list[tuple[float, float]]) -> None:
+        # Intentional architecture flaw: shared "active" slot overwrites by last writer.
+        models["active"] = {
+            "session": session_id,
+            "center": center,
+            "n_samples": len(data),
+        }
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        fa = pool.submit(train_model, "session_a", 2.0, train_a)
+        fb = pool.submit(train_model, "session_b", 7.0, train_b)
+        fa.result()
+        fb.result()
+
+    def predict_session(_session_id: str) -> list[int]:
+        nonlocal prediction_count
+
+        chunks = _chunk_strided(test_points, threads)
+
+        def predict_chunk(chunk: list[tuple[float, float]]) -> list[int]:
+            nonlocal prediction_count
+
+            out: list[int] = []
+            for point in chunk:
+                model = models.get("active", {"center": 5.0})
+                out.append(_predict_point(point, model["center"]))
+
+                # Intentional read-modify-write race in unsafe mode
+                current = prediction_count
+                prediction_count = current + 1
+
+            return out
+
+        preds: list[int] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as pool:
+            futures = [pool.submit(predict_chunk, chunk) for chunk in chunks]
+            for fut in futures:
+                preds.extend(fut.result())
+
+        return preds
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        fa = pool.submit(predict_session, "session_a")
+        fb = pool.submit(predict_session, "session_b")
+        preds_a = fa.result()
+        preds_b = fb.result()
+
+    expected_a = [_predict_point(point, 2.0) for point in test_points]
+    expected_b = [_predict_point(point, 7.0) for point in test_points]
+    expected_divergence = sum(1 for a, b in zip(expected_a, expected_b) if a != b)
+
+    observed_divergence = sum(1 for a, b in zip(preds_a, preds_b) if a != b)
+
+    expected_prediction_count = num_test * 2
+    lost_predictions = expected_prediction_count - prediction_count
+
+    ok = (
+        observed_divergence == expected_divergence
+        and prediction_count == expected_prediction_count
+        and set(models.keys()) == {"session_a", "session_b"}
+    )
+
+    details = [
+        f"session_isolation: expected_divergence={expected_divergence} observed_divergence={observed_divergence}",
+        f"shared_model_owner={models.get('active', {}).get('session', '?')} center={models.get('active', {}).get('center', '?')}",
+        f"predictions: expected={expected_prediction_count} observed={prediction_count} lost={lost_predictions} ({_pct(lost_predictions, expected_prediction_count)}%)",
+        f"train_samples_per_session={num_train}",
+        "hazard: single shared active model slot + lock-free counter",
+    ]
+    return ok, details
+
+
+def _ml_scoring_safe(threads: int) -> tuple[bool, list[str]]:
+    num_train = 2000
+    num_test = 2000
+
+    train_a = _generate_training_data(seed=42, n=num_train, center0=2.0, center1=3.0)
+    train_b = _generate_training_data(seed=43, n=num_train, center0=7.0, center1=8.0)
+    test_points = _generate_test_points(seed=99, n=num_test)
+
+    models: dict[str, dict] = {}
+    model_lock = threading.Lock()
+
+    prediction_count = 0
+    count_lock = threading.Lock()
+
+    def train_model(session_id: str, center: float, data: list[tuple[float, float]]) -> None:
+        with model_lock:
+            models[session_id] = {
+                "session": session_id,
+                "center": center,
+                "n_samples": len(data),
+            }
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        fa = pool.submit(train_model, "session_a", 2.0, train_a)
+        fb = pool.submit(train_model, "session_b", 7.0, train_b)
+        fa.result()
+        fb.result()
+
+    def predict_session(session_id: str) -> list[int]:
+        nonlocal prediction_count
+
+        with model_lock:
+            model = dict(models[session_id])
+
+        center = model["center"]
+        chunks = _chunk_strided(test_points, threads)
+
+        def predict_chunk(chunk: list[tuple[float, float]]) -> list[int]:
+            nonlocal prediction_count
+
+            out: list[int] = []
+            for point in chunk:
+                out.append(_predict_point(point, center))
+                with count_lock:
+                    prediction_count += 1
+            return out
+
+        preds: list[int] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as pool:
+            futures = [pool.submit(predict_chunk, chunk) for chunk in chunks]
+            for fut in futures:
+                preds.extend(fut.result())
+
+        return preds
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        fa = pool.submit(predict_session, "session_a")
+        fb = pool.submit(predict_session, "session_b")
+        preds_a = fa.result()
+        preds_b = fb.result()
+
+    expected_a = [_predict_point(point, 2.0) for point in test_points]
+    expected_b = [_predict_point(point, 7.0) for point in test_points]
+    expected_divergence = sum(1 for a, b in zip(expected_a, expected_b) if a != b)
+
+    observed_divergence = sum(1 for a, b in zip(preds_a, preds_b) if a != b)
+
+    expected_prediction_count = num_test * 2
+    lost_predictions = expected_prediction_count - prediction_count
+
+    ok = (
+        observed_divergence == expected_divergence
+        and prediction_count == expected_prediction_count
+        and set(models.keys()) == {"session_a", "session_b"}
+        and models["session_a"]["n_samples"] == num_train
+        and models["session_b"]["n_samples"] == num_train
+    )
+
+    details = [
+        f"session_isolation: expected_divergence={expected_divergence} observed_divergence={observed_divergence}",
+        f"models_stored={sorted(models.keys())}",
+        f"predictions: expected={expected_prediction_count} observed={prediction_count} lost={lost_predictions} ({_pct(lost_predictions, expected_prediction_count)}%)",
+        f"train_samples_per_session={num_train}",
+        "solution: session-keyed models + synchronized counters",
+    ]
+    return ok, details
+
+
+# ---------------------------------------------------------------------------
+# Example 5: image_pipeline (200 images, pure-Python resize simulation)
+# ---------------------------------------------------------------------------
+
+
+def _generate_image_specs(seed: int = 42) -> list[dict]:
+    rng = random.Random(seed)
+
+    specs: list[dict] = []
+
+    for _ in range(50):
+        specs.append(
+            {
+                "width": 100 + rng.randint(1, 300),
+                "height": 100 + rng.randint(1, 300),
+                "color": [rng.randint(0, 255), rng.randint(0, 255), rng.randint(0, 255)],
+                "label": "small",
+            }
+        )
+
+    for _ in range(80):
+        specs.append(
+            {
+                "width": 500 + rng.randint(1, 780),
+                "height": 400 + rng.randint(1, 520),
+                "color": [rng.randint(0, 255), rng.randint(0, 255), rng.randint(0, 255)],
+                "label": "medium",
+            }
+        )
+
+    for _ in range(50):
+        specs.append(
+            {
+                "width": 1920,
+                "height": 1080,
+                "color": [rng.randint(0, 255), rng.randint(0, 255), rng.randint(0, 255)],
+                "label": "large-1080p",
+            }
+        )
+
+    for _ in range(20):
+        specs.append(
+            {
+                "width": 3840,
+                "height": 2160,
+                "color": [rng.randint(0, 255), rng.randint(0, 255), rng.randint(0, 255)],
+                "label": "xl-4k",
+            }
+        )
+
+    rng.shuffle(specs)
+    return specs
+
+
+def _build_image_payloads() -> list[dict]:
+    payloads: list[dict] = []
+
+    for spec in _generate_image_specs():
+        width = spec["width"]
+        height = spec["height"]
+
+        payloads.append(
+            {
+                "width": width,
+                "height": height,
+                "pixel_count": width * height,
+                "color": tuple(spec["color"]),
+                "label": spec["label"],
+            }
+        )
+
+    return payloads
+
+
+def _make_source_buffer(width: int, height: int, color: tuple[int, int, int]) -> bytearray:
+    pixel = bytes((color[0], color[1], color[2]))
+    return bytearray(pixel * (width * height))
+
+
+def _resize_nearest(src: bytearray, src_w: int, src_h: int, dst_w: int, dst_h: int) -> bytearray:
+    dst = bytearray(dst_w * dst_h * 3)
+
+    for y in range(dst_h):
+        sy = min(src_h - 1, (y * src_h) // max(dst_h, 1))
+        src_row = sy * src_w * 3
+        dst_row = y * dst_w * 3
+
+        for x in range(dst_w):
+            sx = min(src_w - 1, (x * src_w) // max(dst_w, 1))
+            si = src_row + sx * 3
+            di = dst_row + x * 3
+            dst[di] = src[si]
+            dst[di + 1] = src[si + 1]
+            dst[di + 2] = src[si + 2]
+
+    return dst
+
+
+def _weighted_batches(items: list[dict], max_weight: int) -> list[list[dict]]:
+    batches: list[list[dict]] = []
+    current: list[dict] = []
+    weight = 0
+
+    for item in items:
+        item_weight = item["pixel_count"]
+
+        if current and weight + item_weight > max_weight:
+            batches.append(current)
+            current = [item]
+            weight = item_weight
+        else:
+            current.append(item)
+            weight += item_weight
+
+    if current:
+        batches.append(current)
+
+    return batches
+
+
+def _image_pipeline_unsafe(threads: int) -> tuple[bool, list[str]]:
+    payloads = _build_image_payloads()
+
+    in_flight = 0
+    peak_in_flight = 0
+    current_bytes = 0
+    peak_bytes = 0
+    processed = 0
+
+    def process_one(item: dict) -> None:
+        nonlocal in_flight, peak_in_flight, current_bytes, peak_bytes, processed
+
+        width = item["width"]
+        height = item["height"]
+        color = item["color"]
+
+        target_w = 150
+        target_h = max(1, int(height * (target_w / max(width, 1))))
+
+        mem_est = width * height * 3 + target_w * target_h * 3
+
+        # Intentional lock-free counters in unsafe mode
+        current = in_flight
+        in_flight = current + 1
+        current = current_bytes
+        current_bytes = current + mem_est
+
+        peak_in_flight = max(peak_in_flight, in_flight)
+        peak_bytes = max(peak_bytes, current_bytes)
+
+        src = _make_source_buffer(width, height, color)
+        thumb = _resize_nearest(src, width, height, target_w, target_h)
+        _ = thumb[0] if thumb else 0
+
+        current = in_flight
+        in_flight = current - 1
+        current = current_bytes
+        current_bytes = current - mem_est
+        processed += 1
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as pool:
+        futures = [pool.submit(process_one, item) for item in payloads]
+        for fut in futures:
+            fut.result()
+
+    max_in_flight_target = 4
+    ok = processed == len(payloads) and peak_in_flight <= max_in_flight_target
+
+    details = [
+        f"images={len(payloads)} processed={processed}",
+        f"peak_in_flight={peak_in_flight} (bounded_target={max_in_flight_target})",
+        f"peak_memory={peak_bytes / (1024 * 1024):.1f}MB",
+        "hazard: no weighted batching/backpressure + lock-free memory counters",
+    ]
+    return ok, details
+
+
+def _image_pipeline_safe(threads: int) -> tuple[bool, list[str]]:
+    # Keep thread pool creation tied to requested thread count, but enforce
+    # processing bounds via weighted batches + max_in_flight.
+    _ = threads
+
+    payloads = _build_image_payloads()
+
+    max_weight = 2_000_000
+    max_in_flight = 4
+    batches = _weighted_batches(payloads, max_weight=max_weight)
+
+    lock = threading.Lock()
+    image_in_flight = 0
+    peak_image_in_flight = 0
+    batch_in_flight = 0
+    peak_batch_in_flight = 0
+    current_bytes = 0
+    peak_bytes = 0
+    processed = 0
+
+    def process_batch(batch: list[dict]) -> None:
+        nonlocal image_in_flight, peak_image_in_flight
+        nonlocal batch_in_flight, peak_batch_in_flight
+        nonlocal current_bytes, peak_bytes, processed
+
+        with lock:
+            batch_in_flight += 1
+            peak_batch_in_flight = max(peak_batch_in_flight, batch_in_flight)
+
+        try:
+            for item in batch:
+                width = item["width"]
+                height = item["height"]
+                color = item["color"]
+
+                target_w = 150
+                target_h = max(1, int(height * (target_w / max(width, 1))))
+                mem_est = width * height * 3 + target_w * target_h * 3
+
+                with lock:
+                    image_in_flight += 1
+                    peak_image_in_flight = max(peak_image_in_flight, image_in_flight)
+                    current_bytes += mem_est
+                    peak_bytes = max(peak_bytes, current_bytes)
+
+                try:
+                    src = _make_source_buffer(width, height, color)
+                    thumb = _resize_nearest(src, width, height, target_w, target_h)
+                    _ = thumb[0] if thumb else 0
+                finally:
+                    with lock:
+                        image_in_flight -= 1
+                        current_bytes -= mem_est
+                        processed += 1
+        finally:
+            with lock:
+                batch_in_flight -= 1
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_in_flight) as pool:
+        futures = [pool.submit(process_batch, batch) for batch in batches]
+        for fut in futures:
+            fut.result()
+
+    ok = (
+        processed == len(payloads)
+        and peak_batch_in_flight <= max_in_flight
+        and peak_image_in_flight <= max_in_flight
+    )
+
+    details = [
+        f"images={len(payloads)} processed={processed} batches={len(batches)}",
+        f"peak_batch_in_flight={peak_batch_in_flight} (target={max_in_flight})",
+        f"peak_image_in_flight={peak_image_in_flight} (target={max_in_flight})",
+        f"peak_memory={peak_bytes / (1024 * 1024):.1f}MB",
+        "solution: weighted batches + max_in_flight + synchronized counters (pure Python)",
+    ]
+    return ok, details
+
+
+# ---------------------------------------------------------------------------
+# Scenario registry
+# ---------------------------------------------------------------------------
+
+SCENARIOS = {
+    "text_analysis": {
+        "unsafe": _text_analysis_unsafe,
+        "safe": _text_analysis_safe,
+        "description": "5K documents / shared accumulator",
+    },
+    "batch_stats": {
+        "unsafe": _batch_stats_unsafe,
+        "safe": _batch_stats_safe,
+        "description": "2K datasets + poison pills / running stats",
+    },
+    "data_etl": {
+        "unsafe": _data_etl_unsafe,
+        "safe": _data_etl_safe,
+        "description": "15K rows / schema hot-reload contention",
+    },
+    "ml_scoring": {
+        "unsafe": _ml_scoring_unsafe,
+        "safe": _ml_scoring_safe,
+        "description": "2 sessions train+predict / model isolation",
+    },
+    "image_pipeline": {
+        "unsafe": _image_pipeline_unsafe,
+        "safe": _image_pipeline_safe,
+        "description": "200 images / backpressure + memory bounds",
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Runner + CLI
+# ---------------------------------------------------------------------------
+
+
+def _run_mode(example: str, mode: str, threads: int) -> ModeResult:
+    fn = SCENARIOS[example][mode]
+    ok, details, elapsed = _run_timed(lambda: fn(threads))
+
+    mode_label = "unsafe_threaded" if mode == "unsafe" else "safe_python"
+    return ModeResult(mode=mode_label, ok=ok, details=details, elapsed_s=elapsed)
+
+
+def _print_mode_result(result: ModeResult) -> None:
+    status = "PASS" if result.ok else "FAIL"
+    print(f"  {result.mode}: {status} ({result.elapsed_s:.2f}s)")
+    for line in result.details:
+        print(f"    {line}")
+
+
+def _run_one(example: str, mode: str, threads: int) -> tuple[bool, dict[str, str]]:
+    print(f"\n=== Pure Python Comparison: {example} ===")
+    print(f"  desc={SCENARIOS[example]['description']}")
+    print(f"  python_mode={_python_mode_label()} threads={threads}")
+
+    summary: dict[str, str] = {}
+    safe_ok = True
+
+    if mode in ("unsafe", "both"):
+        unsafe = _run_mode(example, "unsafe", threads)
+        _print_mode_result(unsafe)
+        summary["unsafe"] = "PASS" if unsafe.ok else "FAIL"
+
+    if mode in ("safe", "both"):
+        safe = _run_mode(example, "safe", threads)
+        _print_mode_result(safe)
+        summary["safe"] = "PASS" if safe.ok else "FAIL"
+        safe_ok = safe.ok
+
+    return safe_ok, summary
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Run pure-Python threaded baselines (no locks, no sleeps)"
+        description="Pure-Python comparison harness (unsafe threaded vs safe Python)"
     )
+
     parser.add_argument(
         "example",
         nargs="?",
-        choices=sorted(RUNNERS.keys()),
-        help="Which baseline to run",
+        choices=sorted(SCENARIOS.keys()),
+        help="Which example to run",
     )
-    parser.add_argument("--all", action="store_true", help="Run all baselines")
+    parser.add_argument("--all", action="store_true", help="Run all examples")
     parser.add_argument("--threads", type=int, default=48, help="Thread count (default: 48)")
-    parser.add_argument("--rounds", type=int, default=None, help="Override round count")
+    parser.add_argument(
+        "--mode",
+        choices=["unsafe", "safe", "both"],
+        default="both",
+        help="Which Python implementations to run (default: both)",
+    )
+    parser.add_argument(
+        "--require-free-threaded",
+        action="store_true",
+        help="Exit non-zero unless running on free-threaded Python",
+    )
 
     args = parser.parse_args()
 
+    if args.require_free_threaded and not _is_free_threaded():
+        print("ERROR: free-threaded Python is required for this baseline run")
+        print("  current_mode=gil")
+        print("  install: uv python install cpython-3.14.0+freethreaded")
+        return 3
+
+    targets: list[str]
     if args.all:
-        results = []
-        for name in sorted(RUNNERS.keys()):
-            was_corrupted = _run_one(name, args.threads, args.rounds)
-            results.append((name, was_corrupted))
-            print()
+        targets = sorted(SCENARIOS.keys())
+    else:
+        if args.example is None:
+            parser.print_help()
+            return 2
+        targets = [args.example]
 
-        print("=== Summary ===")
-        for name, was_corrupted in results:
-            status = "CORRUPTED" if was_corrupted else "CLEAN"
-            print(f"  {name}: {status}")
-        return 0
+    safe_failures = 0
+    summary_rows: list[tuple[str, dict[str, str]]] = []
 
-    if args.example is None:
-        parser.print_help()
-        return 2
+    for example in targets:
+        safe_ok, row = _run_one(example, args.mode, args.threads)
+        summary_rows.append((example, row))
+        if args.mode in ("safe", "both") and not safe_ok:
+            safe_failures += 1
 
-    _run_one(args.example, args.threads, args.rounds)
+    print("\n=== Summary ===")
+    for example, row in summary_rows:
+        unsafe = row.get("unsafe")
+        safe = row.get("safe")
+
+        if unsafe and safe:
+            print(f"  {example}: unsafe={unsafe} safe={safe}")
+        elif unsafe:
+            print(f"  {example}: unsafe={unsafe}")
+        elif safe:
+            print(f"  {example}: safe={safe}")
+        else:
+            print(f"  {example}: (no mode run)")
+
+    if safe_failures > 0:
+        print(f"\nSAFE MODE FAILURES: {safe_failures}")
+        return 1
+
     return 0
 
 

@@ -58,7 +58,7 @@ Run all stdlib examples:
 mix slither.example --all
 ```
 
-Skip pure-Python threaded baseline comparison:
+Skip pure-Python baseline comparison:
 
 ```bash
 mix slither.example --no-baseline

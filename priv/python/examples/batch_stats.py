@@ -8,10 +8,9 @@ list of dataset dicts and returns a list of result dicts of the SAME LENGTH.
 
 Under free-threaded Python, _running_stats mutations from concurrent threads
 produce incorrect Welford's algorithm results (the mean/variance update is a
-multi-step read-modify-write). A segfault in one thread's C extension call
-kills the entire process and all in-flight work. Slither runs each worker in
-a separate OS process -- accumulator updates are sequential per-worker, and a
-crash in one worker is contained without affecting others.
+multi-step read-modify-write). Slither runs each worker in a separate OS
+process -- accumulator updates are sequential per-worker, and failures are
+isolated to a worker instead of corrupting shared in-process state.
 """
 
 import math
@@ -200,8 +199,7 @@ def compute_stats(datasets):
     Poison-pill datasets (containing None, NaN, empty, or non-numeric values)
     raise an exception that crashes the entire batch.  Slither's on_error: :skip
     drops the failed batch and continues processing other batches -- demonstrating
-    fault isolation that free-threaded Python cannot provide (one thread's crash
-    kills all threads).
+    fault isolation that a single shared thread pool does not provide by default.
     """
     _init_worker()
     results = []

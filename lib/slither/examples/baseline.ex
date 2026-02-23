@@ -1,14 +1,16 @@
 defmodule Slither.Examples.Baseline do
   @moduledoc """
-  Runs pure-Python threaded baseline equivalents for Slither examples.
+  Runs pure-Python comparison baselines for Slither examples.
 
   Searches for a free-threaded Python interpreter in this order:
     1. `SLITHER_BASELINE_PYTHON` env var
-    2. `python3.14t` or `python3.13t` in PATH
-    3. `uv run --python cpython-3.14+freethreaded` (uv manages the runtime)
-    4. System `python3` / `python` with a warning
+    2. `uv run --python cpython-3.14+freethreaded` (uv manages runtime)
+    3. `python3.14t` or `python3.13t` in PATH
 
-  Passes `--threads 48` to match Slither's worker count.
+  Passes:
+    * `--threads <snakepit_pool_size>`
+    * `--mode both` (unsafe threaded + safe pure-python)
+    * `--require-free-threaded` (hard-fail on GIL runtime)
   """
 
   @script_rel_path "priv/python/examples/pure_python_baselines.py"
@@ -30,25 +32,31 @@ defmodule Slither.Examples.Baseline do
   end
 
   defp invoke(script_path, example_name) do
-    thread_args = ["--threads", Integer.to_string(@default_threads)]
+    thread_args = ["--threads", Integer.to_string(baseline_threads())]
+    mode_args = ["--mode", "both", "--require-free-threaded"]
+    script_args = [script_path, example_name] ++ mode_args ++ thread_args
 
     case find_strategy() do
-      {:direct, python, warning} ->
-        if warning, do: IO.puts("  #{warning}")
-        args = [script_path, example_name | thread_args]
-        run_cmd(python, args)
+      {:direct, python} ->
+        run_cmd(python, script_args)
 
-      {:uv, warning} ->
-        if warning, do: IO.puts("  #{warning}")
-
-        args =
-          ["run", "--python", "cpython-3.14+freethreaded", "--", script_path, example_name] ++
-            thread_args
+      {:uv} ->
+        args = ["run", "--python", "cpython-3.14+freethreaded", "--"] ++ script_args
 
         run_cmd("uv", args)
 
       :not_found ->
         {:error, :python_not_found, ""}
+    end
+  end
+
+  defp baseline_threads do
+    case Application.get_env(:snakepit, :pool_config) do
+      %{pool_size: size} when is_integer(size) and size > 0 ->
+        size
+
+      _ ->
+        Application.get_env(:snakepit, :pool_size, @default_threads)
     end
   end
 
@@ -65,20 +73,16 @@ defmodule Slither.Examples.Baseline do
   defp find_strategy do
     cond do
       env = System.get_env("SLITHER_BASELINE_PYTHON") ->
-        {:direct, env, nil}
-
-      exe = System.find_executable("python3.14t") ->
-        {:direct, exe, nil}
-
-      exe = System.find_executable("python3.13t") ->
-        {:direct, exe, nil}
+        {:direct, env}
 
       System.find_executable("uv") ->
-        {:uv, nil}
+        {:uv}
 
-      exe = System.find_executable("python3") || System.find_executable("python") ->
-        {:direct, exe,
-         "WARNING: Using #{exe} (not free-threaded). Install uv or set SLITHER_BASELINE_PYTHON."}
+      exe = System.find_executable("python3.14t") ->
+        {:direct, exe}
+
+      exe = System.find_executable("python3.13t") ->
+        {:direct, exe}
 
       true ->
         :not_found

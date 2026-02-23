@@ -2,7 +2,7 @@ defmodule Slither.Examples.DataEtl.EtlPipe do
   @moduledoc """
   ETL pipeline: prepare -> validate -> transform -> route.
 
-  Processes 10,000 rows through 48 workers with hot-reloadable schemas
+  Processes 15,000 rows through 48 workers with hot-reloadable schemas
   and per-worker audit logs. Demonstrates:
 
     1. Batch 1: 5,000 rows under v1 schema (lenient)
@@ -305,10 +305,10 @@ defmodule Slither.Examples.DataEtl.EtlPipe do
     --- Why This Matters ---
 
       Under free-threaded Python (no GIL):
-        * _audit_log.append() from 48 threads = corrupted list
-        * _validation_count += 1 from 48 threads = lost increments
-        * Reading schema dict while hot-reload thread swaps it = torn read
-        * 10,000 rows across 3 batches = massive contention window
+        * Naive shared counters/lists need explicit synchronization to stay correct
+        * _validation_count += 1 across threads can lose increments without locks
+        * Schema hot-reload must coordinate reads/writes to avoid stale/torn views
+        * 15,000 rows across 3 batches creates a large contention window
 
       Under Slither (process-per-worker):
         * Schema read atomically from ETS -- no torn reads possible

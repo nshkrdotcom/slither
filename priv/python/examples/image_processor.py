@@ -8,13 +8,13 @@ SAME LENGTH. Requires Pillow (PIL).
 Binary image data is transferred as base64-encoded strings since
 SnakeBridge serializes through JSON.
 
-Under free-threaded Python, Pillow's C internals (libImaging) are not
-thread-safe -- concurrent Image.resize() with LANCZOS filter can produce
-corrupted output or segfault. Without backpressure, N threads each loading
-a 4K image simultaneously = N * 25MB memory spike. _memory_watermark
-tracking via read-modify-write is a data race. Slither's WeightedBatch
-strategy caps concurrent pixel processing, max_in_flight limits memory,
-and process isolation makes Pillow safe.
+Under free-threaded Python, naive thread pools still do not provide
+pipeline-level backpressure. Without it, N threads each
+loading a 4K image simultaneously can create N * 25MB memory spikes.
+_memory_watermark tracking via read-modify-write is also a data race.
+Slither's WeightedBatch strategy caps concurrent pixel processing,
+max_in_flight limits memory, and process isolation keeps state scoped
+per worker.
 """
 
 import base64
@@ -184,10 +184,9 @@ def generate_thumbnails(items):
         _memory_watermark = max(_memory_watermark, _current_memory)
         _images_processed += 1
 
-        # Image.resize with LANCZOS is NOT thread-safe in free-threaded
-        # Python -- libImaging's internal buffers can be corrupted when
-        # multiple threads resize concurrently.  Process isolation avoids
-        # this entirely.
+        # This workload intentionally stresses concurrent resize + memory
+        # tracking paths. Slither isolates each worker process and enforces
+        # backpressure in the dispatcher.
         thumb = img.resize((new_w, new_h), Image.LANCZOS)
 
         buf = io.BytesIO()

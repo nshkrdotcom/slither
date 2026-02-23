@@ -274,7 +274,7 @@ defmodule Slither.Examples.BatchStats.StatsDemo do
     IO.puts("  #{total_poison} poison-pill datasets were injected (nil, NaN, empty)")
     IO.puts("  #{total_failed} batch items failed/skipped across all strategies")
     IO.puts("  #{total_succeeded} results still completed successfully")
-    IO.puts("  Under free-threaded Python, one bad dataset crashes all threads.\n")
+    IO.puts("  In a single threaded process, a fatal in-process failure can drop all threads.\n")
   end
 
   # ---------------------------------------------------------------------------

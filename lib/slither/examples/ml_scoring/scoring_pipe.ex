@@ -399,10 +399,11 @@ defmodule Slither.Examples.MlScoring.ScoringPipe do
 
     IO.puts("")
     IO.puts("  Under free-threaded Python:")
-    IO.puts("    - Shared _models dict = one session overwrites another's model")
-    IO.puts("    - _prediction_count += N = read-modify-write race across 48 threads")
-    IO.puts("    - #{@num_train} training samples * 2 sessions = massive concurrent writes")
-    IO.puts("    - #{@num_test} test records scored concurrently through both sessions")
-    IO.puts("    - Slither's process-per-session design eliminates all races\n")
+    IO.puts("    - Naive shared model registries can cross-contaminate session state")
+    IO.puts("    - Shared counters need locking/atomics to avoid lost updates")
+    IO.puts("    - #{@num_train} training samples * 2 sessions means heavy concurrent writes")
+    IO.puts("    - #{@num_test} test records are scored concurrently through both sessions")
+    IO.puts("    - Pure Python can be made safe, but requires explicit coordination everywhere")
+    IO.puts("    - Slither gives isolation and affinity by design\n")
   end
 end

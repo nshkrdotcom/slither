@@ -3,10 +3,11 @@ defmodule Mix.Tasks.Slither.Example do
   @moduledoc """
   Run Slither examples showing why process isolation beats free-threaded Python.
 
-  Each example is a real stress test: 48 workers processing thousands of items
-  on an i9-12900KS (12 cores / 24 threads). The Python baseline uses the same
-  thread count with shared mutable state to demonstrate natural corruption
-  under free-threaded Python.
+  Each example is a real stress test run at the configured Snakepit pool size
+  (48 workers by default). The Python baseline runs in free-threaded Python 3.14
+  and executes both:
+    * `unsafe_threaded` (naive shared-state threading)
+    * `safe_python` (synchronized pure-Python design)
 
   ## Usage
 
@@ -19,7 +20,7 @@ defmodule Mix.Tasks.Slither.Example do
 
       text_analysis   5,000 docs, shared accumulator races         [stdlib]
       batch_stats     2,000 datasets, fault-isolated Welford       [stdlib]
-      data_etl        10,000 rows, hot-reload under contention     [stdlib]
+      data_etl        15,000 rows, hot-reload under contention     [stdlib]
       ml_scoring      2,000 records, session-scoped isolation      [scikit-learn]
       image_pipeline  200 images, backpressure + memory safety     [Pillow]
 
@@ -40,7 +41,7 @@ defmodule Mix.Tasks.Slither.Example do
       {Slither.Examples.BatchStats.StatsDemo, :run_demo,
        "2K Datasets / Fault-Isolated Parallel Compute", :stdlib},
     "data_etl" =>
-      {Slither.Examples.DataEtl.EtlPipe, :run_demo, "10K Rows / Hot-Reload Under Contention",
+      {Slither.Examples.DataEtl.EtlPipe, :run_demo, "15K Rows / Hot-Reload Under Contention",
        :stdlib},
     "ml_scoring" =>
       {Slither.Examples.MlScoring.ScoringPipe, :run_demo,
@@ -55,6 +56,7 @@ defmodule Mix.Tasks.Slither.Example do
     sklearn: ["scikit-learn~=1.3", "numpy~=1.26"],
     pillow: ["Pillow~=10.0"]
   }
+  @default_workers 48
 
   @impl Mix.Task
   def run(args) do
@@ -73,7 +75,7 @@ defmodule Mix.Tasks.Slither.Example do
     Mix.Task.run("app.start")
 
     # Wait for the Snakepit worker pool to be ready.
-    # 48 workers with batch startup may take several seconds.
+    # Large pools with batch startup may take several seconds.
     Snakepit.Pool.await_ready()
 
     # Print system info header
@@ -132,7 +134,7 @@ defmodule Mix.Tasks.Slither.Example do
   end
 
   defp list_examples do
-    Mix.shell().info("\nAvailable Slither examples (48 workers, stress-scale):\n")
+    Mix.shell().info("\nAvailable Slither examples (#{worker_count()} workers, stress-scale):\n")
 
     for {name, {_mod, _fun, desc, deps}} <- Enum.sort(@examples) do
       dep_tag = if deps == :stdlib, do: "[stdlib]", else: "[#{deps}]"
@@ -168,7 +170,9 @@ defmodule Mix.Tasks.Slither.Example do
       |> Enum.filter(fn {_name, {_mod, _fun, _desc, deps}} -> deps == :stdlib end)
       |> Enum.sort_by(fn {name, _} -> name end)
 
-    Mix.shell().info("\nRunning #{length(stdlib_examples)} stdlib examples (48 workers)...\n")
+    Mix.shell().info(
+      "\nRunning #{length(stdlib_examples)} stdlib examples (#{worker_count()} workers)...\n"
+    )
 
     for {name, _} <- stdlib_examples do
       run_example(name, baseline?)
@@ -181,7 +185,9 @@ defmodule Mix.Tasks.Slither.Example do
   defp maybe_run_baseline(_name, false), do: :ok
 
   defp maybe_run_baseline(name, true) do
-    Mix.shell().info("\n\u25b8 Running: Pure-Python Threaded Baseline (48 threads)")
+    Mix.shell().info(
+      "\n\u25b8 Running: Pure-Python Baseline (free-threaded, unsafe+safe, #{worker_count()} threads)"
+    )
 
     case Baseline.run(name) do
       {:ok, output} ->
@@ -210,6 +216,16 @@ defmodule Mix.Tasks.Slither.Example do
 
       :error ->
         :ok
+    end
+  end
+
+  defp worker_count do
+    case Application.get_env(:snakepit, :pool_config) do
+      %{pool_size: size} when is_integer(size) and size > 0 ->
+        size
+
+      _ ->
+        Application.get_env(:snakepit, :pool_size, @default_workers)
     end
   end
 end
