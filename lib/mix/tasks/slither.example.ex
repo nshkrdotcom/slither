@@ -3,9 +3,10 @@ defmodule Mix.Tasks.Slither.Example do
   @moduledoc """
   Run Slither examples showing why process isolation beats free-threaded Python.
 
-  Each example demonstrates a concurrency scenario that breaks under naive
-  free-threaded Python (PEP 703) but works correctly under Slither's
-  process-per-worker architecture.
+  Each example is a real stress test: 48 workers processing thousands of items
+  on an i9-12900KS (12 cores / 24 threads). The Python baseline uses the same
+  thread count with shared mutable state to demonstrate natural corruption
+  under free-threaded Python.
 
   ## Usage
 
@@ -16,11 +17,11 @@ defmodule Mix.Tasks.Slither.Example do
 
   ## Available Examples
 
-      text_analysis   Shared accumulator races (Store + Pipe)       [stdlib]
-      batch_stats     Fault-isolated parallel compute (Dispatch)    [stdlib]
-      data_etl        Hot-reload under contention (Store + Pipe)    [stdlib]
-      ml_scoring      Session-scoped state isolation (Pipe)         [scikit-learn]
-      image_pipeline  Backpressure + memory safety (WeightedBatch)  [Pillow]
+      text_analysis   5,000 docs, shared accumulator races         [stdlib]
+      batch_stats     2,000 datasets, fault-isolated Welford       [stdlib]
+      data_etl        10,000 rows, hot-reload under contention     [stdlib]
+      ml_scoring      2,000 records, session-scoped isolation      [scikit-learn]
+      image_pipeline  200 images, backpressure + memory safety     [Pillow]
 
   Examples marked [stdlib] require no Python packages beyond the standard library.
   Examples with third-party deps are installed automatically via Snakepit/uv.
@@ -29,21 +30,24 @@ defmodule Mix.Tasks.Slither.Example do
   use Mix.Task
 
   alias Slither.Examples.Baseline
+  alias Slither.Examples.Reporter
 
   @examples %{
     "text_analysis" =>
-      {Slither.Examples.TextAnalysis.TextPipe, :run_demo, "Shared Accumulator Races", :stdlib},
-    "batch_stats" =>
-      {Slither.Examples.BatchStats.StatsDemo, :run_demo, "Fault-Isolated Parallel Compute",
+      {Slither.Examples.TextAnalysis.TextPipe, :run_demo, "5K Docs / Shared Accumulator Races",
        :stdlib},
+    "batch_stats" =>
+      {Slither.Examples.BatchStats.StatsDemo, :run_demo,
+       "2K Datasets / Fault-Isolated Parallel Compute", :stdlib},
     "data_etl" =>
-      {Slither.Examples.DataEtl.EtlPipe, :run_demo, "Hot-Reload Under Contention", :stdlib},
+      {Slither.Examples.DataEtl.EtlPipe, :run_demo, "10K Rows / Hot-Reload Under Contention",
+       :stdlib},
     "ml_scoring" =>
-      {Slither.Examples.MlScoring.ScoringPipe, :run_demo, "Session-Scoped State Isolation",
-       :sklearn},
+      {Slither.Examples.MlScoring.ScoringPipe, :run_demo,
+       "2K Records / Session-Scoped State Isolation", :sklearn},
     "image_pipeline" =>
-      {Slither.Examples.ImagePipeline.ThumbnailDemo, :run_demo, "Backpressure + Memory Safety",
-       :pillow}
+      {Slither.Examples.ImagePipeline.ThumbnailDemo, :run_demo,
+       "200 Images / Backpressure + Memory Safety", :pillow}
   }
 
   # PEP-440 requirements for non-stdlib examples, installed via Snakepit/uv
@@ -68,11 +72,12 @@ defmodule Mix.Tasks.Slither.Example do
     # Now start the application (which starts Snakepit Python workers)
     Mix.Task.run("app.start")
 
-    # Wait for the Snakepit worker pool to be ready before running examples.
-    # Pool initialization is asynchronous -- without this, examples that call
-    # Dispatch.run directly (rather than through Pipe.Runner) may hit the pool
-    # before workers have started.
+    # Wait for the Snakepit worker pool to be ready.
+    # 48 workers with batch startup may take several seconds.
     Snakepit.Pool.await_ready()
+
+    # Print system info header
+    Reporter.print_system_info()
 
     case parse_args(args) do
       :list ->
@@ -127,7 +132,7 @@ defmodule Mix.Tasks.Slither.Example do
   end
 
   defp list_examples do
-    Mix.shell().info("\nAvailable Slither examples:\n")
+    Mix.shell().info("\nAvailable Slither examples (48 workers, stress-scale):\n")
 
     for {name, {_mod, _fun, desc, deps}} <- Enum.sort(@examples) do
       dep_tag = if deps == :stdlib, do: "[stdlib]", else: "[#{deps}]"
@@ -163,7 +168,7 @@ defmodule Mix.Tasks.Slither.Example do
       |> Enum.filter(fn {_name, {_mod, _fun, _desc, deps}} -> deps == :stdlib end)
       |> Enum.sort_by(fn {name, _} -> name end)
 
-    Mix.shell().info("\nRunning #{length(stdlib_examples)} stdlib examples...\n")
+    Mix.shell().info("\nRunning #{length(stdlib_examples)} stdlib examples (48 workers)...\n")
 
     for {name, _} <- stdlib_examples do
       run_example(name, baseline?)
@@ -176,7 +181,7 @@ defmodule Mix.Tasks.Slither.Example do
   defp maybe_run_baseline(_name, false), do: :ok
 
   defp maybe_run_baseline(name, true) do
-    Mix.shell().info("\n▸ Running: Pure-Python Threaded Baseline")
+    Mix.shell().info("\n\u25b8 Running: Pure-Python Threaded Baseline (48 threads)")
 
     case Baseline.run(name) do
       {:ok, output} ->

@@ -2,84 +2,25 @@ defmodule Slither.Examples.ImagePipeline.ThumbnailDemo do
   @moduledoc """
   Demonstrates why process isolation beats free-threaded Python for image work.
 
-  Generates 30 test images (up to 4K resolution) in Python via Pillow, then
-  creates thumbnails using the `WeightedBatch` strategy where batch boundaries
-  are determined by total pixel count.  After processing, collects per-worker
-  memory statistics to show that Slither's backpressure kept peak memory bounded.
+  Generates 200 test images (50 small, 80 medium, 50 large 1080p, 20 XL 4K)
+  in Python via Pillow, then creates thumbnails using `WeightedBatch` where
+  batch boundaries are determined by total pixel count.
 
-  ## Why This Exists
+  After processing, collects per-worker memory statistics and reports
+  megapixels/sec throughput.
 
-  Under free-threaded Python (PEP 703):
-    - Pillow's C internals (libImaging) are not thread-safe; concurrent
-      `Image.resize(LANCZOS)` can produce corrupted output or segfault
-    - No built-in backpressure means 16 threads each loading a 4K image
-      = 500MB+ memory spike
-    - One thread's segfault kills ALL threads
-
-  Under Slither:
-    - `WeightedBatch` groups images by pixel count so large images get
-      their own batch
-    - `max_in_flight: 2` caps concurrent batches (backpressure)
-    - Each Python worker is a separate OS process, so Pillow is safe
-    - A crash in one worker does not affect others
-
-  Run with:
-
-      Slither.Examples.ImagePipeline.ThumbnailDemo.run_demo()
+  Run with `Slither.Examples.ImagePipeline.ThumbnailDemo.run_demo/0`.
   """
 
   alias Slither.Dispatch
   alias Slither.Dispatch.Strategies.FixedBatch
   alias Slither.Dispatch.Strategies.WeightedBatch
+  alias Slither.Examples.Reporter
   alias Slither.Item
 
-  # 30 image specs: from tiny 100x100 to 4K, with duplicates of larger sizes
-  # to create meaningful backpressure.
-  @image_specs [
-    # Small images
-    %{width: 100, height: 100, color: [255, 100, 100], label: "tiny"},
-    %{width: 200, height: 150, color: [100, 255, 100], label: "small-1"},
-    %{width: 200, height: 200, color: [100, 100, 255], label: "small-2"},
-    %{width: 320, height: 240, color: [200, 200, 100], label: "qvga"},
-    %{width: 400, height: 300, color: [255, 255, 100], label: "medium-1"},
-    # Medium images
-    %{width: 500, height: 400, color: [100, 255, 255], label: "medium-2"},
-    %{width: 640, height: 480, color: [255, 100, 255], label: "vga"},
-    %{width: 800, height: 600, color: [200, 150, 100], label: "svga"},
-    %{width: 1024, height: 768, color: [100, 200, 150], label: "xga"},
-    %{width: 1280, height: 720, color: [150, 100, 200], label: "hd-720"},
-    # Large images
-    %{width: 1920, height: 1080, color: [180, 180, 100], label: "hd-1080"},
-    %{width: 2560, height: 1440, color: [100, 180, 180], label: "qhd"},
-    %{width: 3840, height: 2160, color: [180, 100, 180], label: "4k"},
-    # Duplicates of large sizes to stress backpressure
-    %{width: 1920, height: 1080, color: [160, 200, 100], label: "hd-1080-b"},
-    %{width: 1920, height: 1080, color: [100, 160, 200], label: "hd-1080-c"},
-    %{width: 2560, height: 1440, color: [200, 100, 160], label: "qhd-b"},
-    %{width: 2560, height: 1440, color: [160, 100, 200], label: "qhd-c"},
-    %{width: 3840, height: 2160, color: [200, 160, 100], label: "4k-b"},
-    %{width: 3840, height: 2160, color: [100, 200, 160], label: "4k-c"},
-    %{width: 3840, height: 2160, color: [140, 140, 200], label: "4k-d"},
-    # More medium images for batch variety
-    %{width: 640, height: 480, color: [220, 120, 120], label: "vga-b"},
-    %{width: 800, height: 600, color: [120, 220, 120], label: "svga-b"},
-    %{width: 1024, height: 768, color: [120, 120, 220], label: "xga-b"},
-    %{width: 1280, height: 720, color: [220, 220, 120], label: "hd-720-b"},
-    %{width: 1280, height: 720, color: [120, 220, 220], label: "hd-720-c"},
-    # Extra large duplicates
-    %{width: 1920, height: 1080, color: [200, 200, 200], label: "hd-1080-d"},
-    %{width: 2560, height: 1440, color: [180, 140, 180], label: "qhd-d"},
-    %{width: 3840, height: 2160, color: [140, 180, 140], label: "4k-e"},
-    %{width: 1280, height: 720, color: [200, 140, 140], label: "hd-720-d"},
-    %{width: 1920, height: 1080, color: [140, 200, 140], label: "hd-1080-e"}
-  ]
-
   @max_weight 2_000_000
-  @max_in_flight 2
+  @max_in_flight 4
 
-  @doc """
-  Run the full image thumbnail demo, printing results to stdout.
-  """
   def run_demo do
     IO.puts("\n=== Slither Example: Image Thumbnail Pipeline ===\n")
 
@@ -120,10 +61,16 @@ defmodule Slither.Examples.ImagePipeline.ThumbnailDemo do
   # ---------------------------------------------------------------------------
 
   defp do_run_demo do
-    images = generate_images()
+    image_specs = generate_image_specs()
+    IO.puts("Generating #{length(image_specs)} test images (#{count_by_size(image_specs)})...")
+
+    images = generate_images(image_specs)
     print_generated_images(images)
+
     {thumbnails, time} = create_thumbnails(images)
     print_thumbnail_results(thumbnails, time)
+    print_megapixels_throughput(images, time)
+
     memory_stats = collect_memory_stats()
     print_memory_stats(memory_stats)
     print_backpressure_analysis(thumbnails, memory_stats)
@@ -133,38 +80,87 @@ defmodule Slither.Examples.ImagePipeline.ThumbnailDemo do
   end
 
   # ---------------------------------------------------------------------------
+  # Image spec generation — 200 images
+  # ---------------------------------------------------------------------------
+
+  defp generate_image_specs do
+    :rand.seed(:exsss, {42, 137, 256})
+
+    # 50 small images (100-400px)
+    small =
+      for _ <- 1..50 do
+        w = 100 + :rand.uniform(300)
+        h = 100 + :rand.uniform(300)
+        color = [:rand.uniform(255), :rand.uniform(255), :rand.uniform(255)]
+        %{width: w, height: h, color: color, label: "small"}
+      end
+
+    # 80 medium images (500-1280px)
+    medium =
+      for _ <- 1..80 do
+        w = 500 + :rand.uniform(780)
+        h = 400 + :rand.uniform(520)
+        color = [:rand.uniform(255), :rand.uniform(255), :rand.uniform(255)]
+        %{width: w, height: h, color: color, label: "medium"}
+      end
+
+    # 50 large images (1080p)
+    large =
+      for _ <- 1..50 do
+        color = [:rand.uniform(255), :rand.uniform(255), :rand.uniform(255)]
+        %{width: 1920, height: 1080, color: color, label: "large-1080p"}
+      end
+
+    # 20 XL images (4K)
+    xl =
+      for _ <- 1..20 do
+        color = [:rand.uniform(255), :rand.uniform(255), :rand.uniform(255)]
+        %{width: 3840, height: 2160, color: color, label: "xl-4k"}
+      end
+
+    (small ++ medium ++ large ++ xl) |> Enum.shuffle()
+  end
+
+  defp count_by_size(specs) do
+    counts = Enum.frequencies_by(specs, & &1.label)
+
+    ["small", "medium", "large-1080p", "xl-4k"]
+    |> Enum.map_join(", ", fn label -> "#{Map.get(counts, label, 0)} #{label}" end)
+  end
+
+  # ---------------------------------------------------------------------------
   # Step 1: Generate test images (FixedBatch)
   # ---------------------------------------------------------------------------
 
-  defp generate_images do
-    IO.puts("Generating #{length(@image_specs)} test images...")
+  defp generate_images(specs) do
+    spec_items = Item.wrap_many(specs)
 
-    spec_items = Item.wrap_many(@image_specs)
+    {time, {:ok, images}} =
+      :timer.tc(fn ->
+        Dispatch.run(spec_items,
+          executor: Slither.Dispatch.Executors.SnakeBridge,
+          module: "image_processor",
+          function: "generate_test_images",
+          strategy: FixedBatch,
+          batch_size: 20,
+          max_in_flight: 8
+        )
+      end)
 
-    {:ok, images} =
-      Dispatch.run(spec_items,
-        executor: Slither.Dispatch.Executors.SnakeBridge,
-        module: "image_processor",
-        function: "generate_test_images",
-        strategy: FixedBatch,
-        batch_size: 10,
-        max_in_flight: 2
-      )
-
+    Reporter.print_timing("Image generation", time)
     images
   end
 
   defp print_generated_images(images) do
+    # Show distribution summary instead of each image
+    sizes = Enum.map(images, fn img -> img.payload["width"] * img.payload["height"] end)
+    total_pixels = Enum.sum(sizes)
+    total_bytes = Enum.sum(Enum.map(images, fn img -> img.payload["size_bytes"] end))
+
     IO.puts("  Generated #{length(images)} images:")
-
-    for img <- images do
-      p = img.payload
-      pixels = p["width"] * p["height"]
-
-      IO.puts(
-        "    #{p["label"]}: #{p["width"]}x#{p["height"]} (#{format_pixels(pixels)}, #{format_bytes(p["size_bytes"])})"
-      )
-    end
+    IO.puts("    Total pixels: #{format_pixels(total_pixels)}")
+    IO.puts("    Total size: #{format_bytes(total_bytes)}")
+    IO.puts("    Range: #{format_pixels(Enum.min(sizes))} - #{format_pixels(Enum.max(sizes))}")
   end
 
   # ---------------------------------------------------------------------------
@@ -173,7 +169,7 @@ defmodule Slither.Examples.ImagePipeline.ThumbnailDemo do
 
   defp create_thumbnails(images) do
     IO.puts(
-      "\nCreating thumbnails with WeightedBatch (max_weight: #{format_pixels(@max_weight)})...\n"
+      "\nCreating thumbnails with WeightedBatch (max_weight: #{format_pixels(@max_weight)}, max_in_flight: #{@max_in_flight})...\n"
     )
 
     thumb_items = build_thumb_items(images)
@@ -214,26 +210,28 @@ defmodule Slither.Examples.ImagePipeline.ThumbnailDemo do
   end
 
   defp print_thumbnail_results(thumbnails, time) do
-    IO.puts("  Thumbnails generated in #{div(time, 1000)}ms:")
-
-    for thumb <- thumbnails do
-      p = thumb.payload
-      [ow, oh] = p["original_size"]
-      [tw, th] = p["thumb_size"]
-
-      IO.puts(
-        "    #{ow}x#{oh} -> #{tw}x#{th} " <>
-          "(#{format_bytes(p["original_bytes"])} -> #{format_bytes(p["thumb_bytes"])})"
-      )
-    end
+    Reporter.print_timing("Thumbnail creation", time)
 
     {total_original, total_thumb} = sum_bytes(thumbnails)
     ratio = Float.round(total_thumb / max(total_original, 1) * 100, 1)
 
     IO.puts(
-      "\n  Total: #{format_bytes(total_original)} -> #{format_bytes(total_thumb)} " <>
+      "  #{length(thumbnails)} thumbnails: #{format_bytes(total_original)} -> #{format_bytes(total_thumb)} " <>
         "(#{ratio}% of original)"
     )
+  end
+
+  defp print_megapixels_throughput(images, time_us) do
+    total_pixels =
+      Enum.sum(Enum.map(images, fn img -> img.payload["width"] * img.payload["height"] end))
+
+    megapixels = total_pixels / 1_000_000
+    seconds = time_us / 1_000_000
+    mp_per_sec = Float.round(megapixels / max(seconds, 0.001), 1)
+
+    IO.puts("  Throughput: #{mp_per_sec} megapixels/sec (#{Float.round(megapixels, 1)} MP total)")
+    Reporter.print_throughput("Images/sec", {length(images), time_us})
+    IO.puts("")
   end
 
   # ---------------------------------------------------------------------------
@@ -241,23 +239,22 @@ defmodule Slither.Examples.ImagePipeline.ThumbnailDemo do
   # ---------------------------------------------------------------------------
 
   defp collect_memory_stats do
-    IO.puts("\n--- Per-Worker Memory Statistics ---\n")
+    IO.puts("--- Per-Worker Memory Statistics ---\n")
 
-    # Send a stats request to each worker in the pool.  We send multiple
-    # items so that if the pool has >1 worker we hear from each one.
-    stats_items = Item.wrap_many(for _ <- 1..4, do: %{})
+    stats_items = Item.wrap_many(for _ <- 1..200, do: %{})
 
     case Dispatch.run(stats_items,
            executor: Slither.Dispatch.Executors.SnakeBridge,
            module: "image_processor",
            function: "get_memory_stats",
            batch_size: 1,
-           max_in_flight: 4,
+           max_in_flight: 16,
            on_error: :skip
          ) do
       {:ok, results} ->
         results
         |> Enum.map(& &1.payload)
+        |> Enum.reject(fn s -> s["worker_id"] == nil end)
         |> Enum.uniq_by(& &1["worker_id"])
 
       _ ->
@@ -270,7 +267,7 @@ defmodule Slither.Examples.ImagePipeline.ThumbnailDemo do
   end
 
   defp print_memory_stats(stats) do
-    for s <- stats do
+    for s <- Enum.take(stats, 10) do
       IO.puts("  Worker #{s["worker_id"]}:")
       IO.puts("    Images processed:  #{s["images_processed"]}")
 
@@ -280,6 +277,12 @@ defmodule Slither.Examples.ImagePipeline.ThumbnailDemo do
 
       IO.puts("    Current memory:    #{format_bytes(s["current_memory_bytes"])}")
     end
+
+    if length(stats) > 10 do
+      IO.puts("  ... and #{length(stats) - 10} more workers")
+    end
+
+    IO.puts("\n  Workers reached: #{length(stats)} of 48")
   end
 
   # ---------------------------------------------------------------------------
@@ -341,13 +344,14 @@ defmodule Slither.Examples.ImagePipeline.ThumbnailDemo do
     IO.puts("\n--- Why This Matters ---\n")
 
     IO.puts("  Under free-threaded Python:")
-    IO.puts("    - 16 threads * 4K image = 400MB+ spike, no backpressure")
+    IO.puts("    - 48 threads * 4K image = 1.5GB+ spike, no backpressure")
     IO.puts("    - Pillow's Image.resize(LANCZOS) is not thread-safe in free-threaded builds")
     IO.puts("    - _memory_watermark = max(...) is a read-modify-write data race")
     IO.puts("    - One thread's segfault kills ALL threads")
     IO.puts("")
     IO.puts("  Under Slither:")
     IO.puts("    - WeightedBatch + max_in_flight = bounded memory, real backpressure")
+    IO.puts("    - 200 images across 48 workers = safe concurrency at scale")
     IO.puts("    - Process isolation = safe Pillow (each worker is a separate OS process)")
     IO.puts("    - A crash in one worker does not affect others")
     IO.puts("    - Per-worker memory stats are race-free (no shared mutable state)")

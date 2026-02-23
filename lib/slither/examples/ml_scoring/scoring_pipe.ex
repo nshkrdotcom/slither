@@ -2,48 +2,26 @@ defmodule Slither.Examples.MlScoring.ScoringPipe do
   @moduledoc """
   ML scoring pipeline: enrich -> featurize -> predict -> route by confidence.
 
-  Demonstrates session-scoped Python object references and the full
-  Slither pipeline lifecycle:
+  Scaled to 2,000 training samples per session and 2,000 test records,
+  processed through 48 workers with `batch_size: 100`.
 
-    1. **enrich** (beam) -- checks the ETS feature cache for pre-computed
-       features; on a miss, packages raw data for Python featurization.
-       Attaches the `model_id` from context metadata to every item.
-    2. **featurize** (python) -- extracts numeric features from raw data
-       dicts, or passes through items that already have cached features.
-    3. **predict** (python) -- runs batch prediction using a scikit-learn
-       model stored in the Python session. Session affinity ensures the
-       model trained by `train_model` is accessible.
-    4. **route_by_confidence** (router) -- splits results into
-       `:high_confidence` (>= 0.9) and `:low_confidence` (< 0.6) buckets;
-       mid-range items go to `:default`.
+  Trains TWO models on TWO sessions concurrently, then scores test records
+  through each session's pipeline independently via `Task.async` to prove
+  session isolation.
 
-  ## Concurrent Session Isolation
-
-  The `run_demo/0` function trains TWO models on TWO separate sessions
-  simultaneously, then scores test records through each session's
-  pipeline independently. This proves that:
-
-    - Session A's model is isolated to its worker process
-    - Session B's model is isolated to its worker process
-    - Predictions through session A use model A (not B)
-    - Predictions through session B use model B (not A)
-
-  Under free-threaded Python, a shared `_models` dict mutated from
-  multiple threads would lead to corruption -- one session could
-  silently overwrite another's model. Slither's process-per-session
-  design eliminates this by construction.
-
-  Requires scikit-learn and numpy. Run with:
-
-      Slither.Examples.MlScoring.ScoringPipe.run_demo()
+  Run with `Slither.Examples.MlScoring.ScoringPipe.run_demo/0`.
   """
 
   use Slither.Pipe
 
   alias Slither.{Context, Dispatch, Item}
   alias Slither.Examples.MlScoring.FeatureStore
+  alias Slither.Examples.Reporter
   alias Slither.Pipe.Runner
   alias Slither.Store.Server
+
+  @num_train 2000
+  @num_test 2000
 
   pipe :ml_scoring do
     store(:features, FeatureStore)
@@ -54,14 +32,14 @@ defmodule Slither.Examples.MlScoring.ScoringPipe do
       executor: Slither.Dispatch.Executors.SnakeBridge,
       module: "ml_scorer",
       function: "featurize_batch",
-      batch_size: 20
+      batch_size: 100
     )
 
     stage(:predict, :python,
       executor: Slither.Dispatch.Executors.SnakeBridge,
       module: "ml_scorer",
       function: "predict_batch",
-      batch_size: 20
+      batch_size: 100
     )
 
     stage(:route_by_confidence, :router,
@@ -79,15 +57,6 @@ defmodule Slither.Examples.MlScoring.ScoringPipe do
     on_error(:*, :halt)
   end
 
-  @doc """
-  Enrich a record with cached features or prepare it for featurization.
-
-  Checks the ETS feature cache for the record's ID. On a cache hit the
-  pre-computed feature vector is used directly; on a miss the raw data
-  map is passed through so the Python featurize stage can extract
-  features. The model ID from context metadata is attached in both cases
-  so the predict stage knows which model to use.
-  """
   def enrich(item, ctx) do
     record_id = item.payload[:id] || item.payload["id"]
     model_id = ctx.metadata[:model_id] || ctx.metadata["model_id"]
@@ -102,14 +71,6 @@ defmodule Slither.Examples.MlScoring.ScoringPipe do
     end
   end
 
-  @doc """
-  Run the ML scoring demo with concurrent session isolation.
-
-  Trains two logistic regression models on separate sessions with
-  different data distributions, then scores test records through each
-  session independently. Demonstrates that Slither's session affinity
-  prevents cross-contamination of model state.
-  """
   def run_demo do
     IO.puts("\n=== Slither Example: ML Scoring Pipeline ===")
     IO.puts("=== Concurrent Session Isolation Demo ===\n")
@@ -144,50 +105,65 @@ defmodule Slither.Examples.MlScoring.ScoringPipe do
     :rand.seed(:exsss, {42, 137, 256})
 
     # --- Phase 1: Train two models on two sessions concurrently ---
-    IO.puts("Phase 1: Training two models on separate sessions...\n")
+    IO.puts("Phase 1: Training two models (#{@num_train} samples each) on separate sessions...\n")
 
     session_a = "scoring_a_#{System.unique_integer([:positive])}"
     session_b = "scoring_b_#{System.unique_integer([:positive])}"
 
-    {train_x_a, train_y_a} = generate_training_data_a(200)
-    {train_x_b, train_y_b} = generate_training_data_b(200)
+    {train_x_a, train_y_a} = generate_training_data_a(@num_train)
+    {train_x_b, train_y_b} = generate_training_data_b(@num_train)
 
-    task_a = Task.async(fn -> train_on_session(train_x_a, train_y_a, session_a, "A") end)
-    task_b = Task.async(fn -> train_on_session(train_x_b, train_y_b, session_b, "B") end)
+    {train_time, {model_a, model_b}} =
+      :timer.tc(fn ->
+        task_a = Task.async(fn -> train_on_session(train_x_a, train_y_a, session_a, "A") end)
+        task_b = Task.async(fn -> train_on_session(train_x_b, train_y_b, session_b, "B") end)
 
-    model_a = Task.await(task_a, 30_000)
-    model_b = Task.await(task_b, 30_000)
+        {Task.await(task_a, 60_000), Task.await(task_b, 60_000)}
+      end)
 
     print_training_result("A", model_a, session_a)
     print_training_result("B", model_b, session_b)
+    Reporter.print_timing("Training (concurrent)", train_time)
+    IO.puts("")
 
-    # --- Phase 2: Score through both sessions ---
-    IO.puts("\nPhase 2: Scoring test records through both sessions...\n")
+    # --- Phase 2: Score through both sessions concurrently ---
+    IO.puts("Phase 2: Scoring #{@num_test} test records through both sessions concurrently...\n")
 
-    pre_populate_cache(3)
-    test_records = generate_test_records(20)
+    pre_populate_cache(10)
+    test_records = generate_test_records(@num_test)
 
-    IO.puts("Scoring #{length(test_records)} records through Session A...")
+    {score_time, {outputs_a, outputs_b}} =
+      :timer.tc(fn ->
+        score_a =
+          Task.async(fn ->
+            Runner.run(__MODULE__, test_records,
+              session_id: session_a,
+              metadata: %{model_id: model_a["model_id"]}
+            )
+          end)
 
-    {:ok, outputs_a} =
-      Runner.run(__MODULE__, test_records,
-        session_id: session_a,
-        metadata: %{model_id: model_a["model_id"]}
-      )
+        score_b =
+          Task.async(fn ->
+            Runner.run(__MODULE__, test_records,
+              session_id: session_b,
+              metadata: %{model_id: model_b["model_id"]}
+            )
+          end)
 
-    IO.puts("Scoring #{length(test_records)} records through Session B...")
+        {:ok, oa} = Task.await(score_a, 120_000)
+        {:ok, ob} = Task.await(score_b, 120_000)
+        {oa, ob}
+      end)
 
-    {:ok, outputs_b} =
-      Runner.run(__MODULE__, test_records,
-        session_id: session_b,
-        metadata: %{model_id: model_b["model_id"]}
-      )
-
-    IO.puts("\n--- Session A Results ---")
+    IO.puts("--- Session A Results ---")
     print_results(outputs_a)
 
     IO.puts("--- Session B Results ---")
     print_results(outputs_b)
+
+    Reporter.print_timing("Scoring (concurrent, both sessions)", score_time)
+    Reporter.print_throughput("Throughput (per session)", {@num_test, score_time})
+    IO.puts("")
 
     print_prediction_differences(outputs_a, outputs_b)
 
@@ -245,7 +221,6 @@ defmodule Slither.Examples.MlScoring.ScoringPipe do
   # --- Data generation ---
 
   defp generate_training_data_a(n) do
-    # Dataset A: class 0 centered at [1,2,1,2], class 1 centered at [3,4,3,4]
     half = div(n, 2)
 
     class_0 =
@@ -262,8 +237,6 @@ defmodule Slither.Examples.MlScoring.ScoringPipe do
   end
 
   defp generate_training_data_b(n) do
-    # Dataset B: class 0 centered at [0,0,0,0], class 1 centered at [5,5,5,5]
-    # Wider separation = different decision boundary than A
     half = div(n, 2)
 
     class_0 =
@@ -291,15 +264,12 @@ defmodule Slither.Examples.MlScoring.ScoringPipe do
       {base_f1, base_f2, base_f3, base_f4} =
         cond do
           rem(i, 3) == 0 ->
-            # Near decision boundary -> low confidence
             {2.0, 3.0, 2.0, 3.0}
 
           rem(i, 2) == 0 ->
-            # Clearly class 1 -> high confidence
             {3.5, 4.5, 3.5, 4.5}
 
           true ->
-            # Clearly class 0 -> high confidence
             {0.5, 1.5, 0.5, 1.5}
         end
 
@@ -341,6 +311,7 @@ defmodule Slither.Examples.MlScoring.ScoringPipe do
         "  Session #{label}: accuracy=#{model_info["accuracy"]}, " <>
           "classes=#{inspect(model_info["classes"])}, " <>
           "features=#{model_info["n_features"]}, " <>
+          "samples=#{model_info["n_samples"]}, " <>
           "worker_pid=#{model_info["worker_id"]}, " <>
           "session=#{session_id}"
       )
@@ -350,26 +321,9 @@ defmodule Slither.Examples.MlScoring.ScoringPipe do
   defp print_results(outputs) do
     for {bucket, items} <- Enum.sort(outputs) do
       IO.puts("  #{bucket} (#{length(items)} items)")
-      items |> Enum.take(3) |> Enum.each(&print_prediction/1)
-
-      if length(items) > 3 do
-        IO.puts("    ... and #{length(items) - 3} more")
-      end
     end
 
     IO.puts("")
-  end
-
-  defp print_prediction(item) do
-    p = item.payload
-
-    probs =
-      case p["probabilities"] do
-        nil -> ""
-        probs_map -> " probs=#{inspect(probs_map)}"
-      end
-
-    IO.puts("    prediction=#{p["prediction"]} confidence=#{p["confidence"]}#{probs}")
   end
 
   defp print_prediction_differences(outputs_a, outputs_b) do
@@ -446,8 +400,9 @@ defmodule Slither.Examples.MlScoring.ScoringPipe do
     IO.puts("")
     IO.puts("  Under free-threaded Python:")
     IO.puts("    - Shared _models dict = one session overwrites another's model")
-    IO.puts("    - _prediction_count += N = read-modify-write race across threads")
-    IO.puts("    - numpy BLAS from multiple threads = undefined C buffer behavior")
-    IO.puts("    - Slither's process-per-session design eliminates all three\n")
+    IO.puts("    - _prediction_count += N = read-modify-write race across 48 threads")
+    IO.puts("    - #{@num_train} training samples * 2 sessions = massive concurrent writes")
+    IO.puts("    - #{@num_test} test records scored concurrently through both sessions")
+    IO.puts("    - Slither's process-per-session design eliminates all races\n")
   end
 end
