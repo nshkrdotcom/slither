@@ -419,9 +419,14 @@ def _image_pipeline_baseline(threads: int = 48, rounds: int = 1) -> tuple[bool, 
         peak_b = peak_bytes
         peak_bytes = max(peak_b, current_bytes)
 
-        # Simulate resize work
+        # Simulate resize work — iterate over pixels to create a real
+        # contention window (threads stay in-flight longer)
         thumb_size = max(1, pixel_count // 64)
-        _ = bytes(thumb_size)
+        thumb = bytearray(thumb_size * 3)
+        # Downsample: strided copy from source buffer
+        stride = max(1, len(buf) // len(thumb))
+        for i in range(len(thumb)):
+            thumb[i] = buf[i * stride % len(buf)]
 
         # Release
         current_in = in_flight
@@ -500,10 +505,10 @@ def _run_one(name: str, threads: int, rounds: int | None) -> int:
 
     if corrupted:
         print("  outcome=CORRUPTED (expected under free-threaded Python)")
-        return 0
+    else:
+        print("  outcome=CLEAN (races did not manifest this run)")
 
-    print("  outcome=CLEAN (races did not manifest -- try free-threaded Python)")
-    return 1
+    return corrupted
 
 
 def main() -> int:
@@ -525,13 +530,13 @@ def main() -> int:
     if args.all:
         results = []
         for name in sorted(RUNNERS.keys()):
-            rc = _run_one(name, args.threads, args.rounds)
-            results.append((name, rc))
+            was_corrupted = _run_one(name, args.threads, args.rounds)
+            results.append((name, was_corrupted))
             print()
 
         print("=== Summary ===")
-        for name, rc in results:
-            status = "CORRUPTED" if rc == 0 else "CLEAN" if rc == 1 else "ERROR"
+        for name, was_corrupted in results:
+            status = "CORRUPTED" if was_corrupted else "CLEAN"
             print(f"  {name}: {status}")
         return 0
 
@@ -539,7 +544,8 @@ def main() -> int:
         parser.print_help()
         return 2
 
-    return _run_one(args.example, args.threads, args.rounds)
+    _run_one(args.example, args.threads, args.rounds)
+    return 0
 
 
 if __name__ == "__main__":
