@@ -65,7 +65,17 @@ defmodule Slither.MixProject do
       licenses: ["MIT"],
       links: %{
         "GitHub" => @source_url
-      }
+      },
+      files: ~w(
+        lib
+        priv/python/**/*.py
+        priv/python/requirements.txt
+        .formatter.exs
+        mix.exs
+        README.md
+        CHANGELOG.md
+        LICENSE
+      )
     ]
   end
 
@@ -77,6 +87,8 @@ defmodule Slither.MixProject do
       logo: "assets/slither.svg",
       extras: [
         "README.md",
+        "CHANGELOG.md",
+        "LICENSE",
         "guides/getting-started.md",
         "guides/architecture.md",
         "guides/store.md",
@@ -97,7 +109,8 @@ defmodule Slither.MixProject do
           "guides/pipe.md",
           "guides/operations.md"
         ],
-        Examples: ["guides/examples.md"]
+        Examples: ["guides/examples.md"],
+        About: ["CHANGELOG.md", "LICENSE"]
       ],
       assets: %{"assets" => "assets"}
     ]

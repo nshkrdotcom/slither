@@ -92,21 +92,23 @@
     <circle cx="100" cy="100" r="14" fill="none" stroke="#97f8cf" stroke-opacity="0.54" stroke-width="1.4"/>
     <circle cx="100" cy="100" r="4" fill="#bfffe6" fill-opacity="0.9"/>
 
-    <path d="M60 66 C60 49 76 38 98 38 C123 38 142 50 142 69 C142 88 127 99 102 106 C76 113 60 124 60 143 C60 160 76 172 100 172 C121 172 138 162 140 146"
-      fill="none" stroke="url(#snakeBody)" stroke-width="11" stroke-linecap="round" stroke-linejoin="round" filter="url(#snakeGlow)" opacity="0.42"/>
+    <g>
+      <path d="M74 80 C74 67 84 58 99 58 C115 58 126 66 126 78 C126 90 116 97 102 102 C86 108 74 116 74 128 C74 139 84 145 99 145 C112 145 122 140 124 132"
+        fill="none" stroke="url(#snakeBody)" stroke-width="11" stroke-linecap="round" stroke-linejoin="round" filter="url(#snakeGlow)" opacity="0.42"/>
 
-    <path d="M60 66 C60 49 76 38 98 38 C123 38 142 50 142 69 C142 88 127 99 102 106 C76 113 60 124 60 143 C60 160 76 172 100 172 C121 172 138 162 140 146"
-      fill="none" stroke="url(#snakeBody)" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M74 80 C74 67 84 58 99 58 C115 58 126 66 126 78 C126 90 116 97 102 102 C86 108 74 116 74 128 C74 139 84 145 99 145 C112 145 122 140 124 132"
+        fill="none" stroke="url(#snakeBody)" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
 
-    <path d="M62 66 C62 50 77 40 97 40 C120 40 138 51 138 68 C138 84 124 95 101 101 C79 107 64 118 64 137 C64 153 78 163 99 163 C118 163 132 156 134 143"
-      fill="none" stroke="url(#snakeSpec)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" opacity="0.82"/>
+      <path d="M76 80 C76 69 85 61 98 61 C112 61 122 68 122 78 C122 88 113 95 101 100 C88 105 77 113 77 123 C77 133 86 138 99 138 C110 138 118 134 120 129"
+        fill="none" stroke="url(#snakeSpec)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" opacity="0.82"/>
 
-    <g transform="translate(141 146) rotate(-18)">
-      <path d="M-3 -6 L8 0 L-3 7 L-7 0 Z" fill="url(#snakeBody)"/>
-      <circle cx="1.2" cy="-1.3" r="1" fill="#0a2b20"/>
+      <g transform="translate(124 132) rotate(-15)">
+        <path d="M-3 -6 L8 0 L-3 7 L-7 0 Z" fill="url(#snakeBody)"/>
+        <circle cx="1.2" cy="-1.3" r="1" fill="#0a2b20"/>
+      </g>
+
+      <path d="M70 77 L74 80 L69 82" fill="none" stroke="#c5ffe8" stroke-opacity="0.72" stroke-width="1.2" stroke-linecap="round"/>
     </g>
-
-    <path d="M56 62 L64 66 L55 68" fill="none" stroke="#c5ffe8" stroke-opacity="0.72" stroke-width="1.2" stroke-linecap="round"/>
   </g>
 
   <use href="#hex" fill="none" stroke="#d9ffef" stroke-opacity="0.22" stroke-width="0.8" stroke-linejoin="round"/>
